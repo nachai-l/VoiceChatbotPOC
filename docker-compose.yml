@@ -3,8 +3,11 @@ services:
     build: .
     ports:
       - "7860:7860"
+    env_file:
+      - path: .env
+        required: false   # won't fail if .env doesn't exist
     environment:
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
     volumes:
       - .:/app
     restart: unless-stopped

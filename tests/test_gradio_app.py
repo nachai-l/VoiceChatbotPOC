@@ -97,6 +97,41 @@ class TestHandleVoiceTurnEarlyExits:
 # stream_audio_chunk — VAD streaming handler
 # ---------------------------------------------------------------------------
 
+class TestAudioOutputNotCleared:
+    """Regression: audio_output must never be set to None on non-audio yields.
+
+    Setting None on gr.Audio clears/stops any currently playing audio.
+    Use gr.update() (no-op) instead so the assistant response keeps playing
+    while silence chunks continue to stream in.
+    """
+
+    @pytest.mark.anyio
+    async def test_none_chunk_does_not_yield_none_audio(self, handler, vad):
+        import gradio as gr
+        results = await _collect(stream_audio_chunk(None, [], handler, vad))
+        audio_out, _, _, _, _, _ = results[0]
+        assert isinstance(audio_out, gr.components.base.Component) or hasattr(audio_out, "__class__") and "update" in str(type(audio_out)).lower() or audio_out != None or True
+        # The real assertion: audio_out must NOT be None
+        assert audio_out is not None, (
+            "audio_output must be gr.update(), not None — "
+            "returning None clears playing audio on every 0.25s stream tick."
+        )
+
+    @pytest.mark.anyio
+    async def test_silence_chunk_does_not_yield_none_audio(self, handler, vad):
+        sr, data = _silence_chunk()
+        results = await _collect(stream_audio_chunk((sr, data), [], handler, vad))
+        audio_out, _, _, _, _, _ = results[0]
+        assert audio_out is not None
+
+    @pytest.mark.anyio
+    async def test_speech_chunk_does_not_yield_none_audio(self, handler, vad):
+        sr, data = _speech_chunk()
+        results = await _collect(stream_audio_chunk((sr, data), [], handler, vad))
+        audio_out, _, _, _, _, _ = results[0]
+        assert audio_out is not None
+
+
 class TestStreamAudioChunkIsAsyncGenerator:
     @pytest.mark.anyio
     async def test_is_async_generator(self, handler, vad):

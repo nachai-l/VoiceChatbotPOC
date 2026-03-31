@@ -47,24 +47,28 @@ async def stream_audio_chunk(
     Yields:
         (audio_output, history, status_md, debug_json, transcript_handler, vad_state)
     """
+    # gr.update() leaves the audio_output component unchanged (prevents clearing playing audio).
+    # Only yield an actual audio value when we have new audio to play.
+    NO_AUDIO = gr.update()
+
     if chunk is None:
-        yield None, history, _status("Listening..."), {}, transcript_handler, vad_state
+        yield NO_AUDIO, history, _status("Listening..."), {}, transcript_handler, vad_state
         return
 
     sample_rate, data = chunk
     if data is None or len(data) == 0:
-        yield None, history, _status("Listening..."), {}, transcript_handler, vad_state
+        yield NO_AUDIO, history, _status("Listening..."), {}, transcript_handler, vad_state
         return
 
     vad_state, should_send = process_chunk(vad_state, sample_rate, data)
 
     if not should_send:
         status = _status("Speaking detected..." if vad_state.is_speaking else "Listening...")
-        yield None, history, status, {}, transcript_handler, vad_state
+        yield NO_AUDIO, history, status, {}, transcript_handler, vad_state
         return
 
     # --- End of utterance detected — send to Live API ---
-    yield None, history, _status("Thinking..."), {}, transcript_handler, vad_state
+    yield NO_AUDIO, history, _status("Thinking..."), {}, transcript_handler, vad_state
 
     audio_array = get_buffer_array(vad_state)
     vad_state = reset_vad(vad_state)
@@ -76,7 +80,7 @@ async def stream_audio_chunk(
         transcript_handler.add_user(result.user_transcript)
         transcript_handler.add_assistant(f"[Error] {result.error}")
         debug = {"error": result.error}
-        yield None, transcript_handler.get_history(), _status("Error", error=True), debug, transcript_handler, vad_state
+        yield NO_AUDIO, transcript_handler.get_history(), _status("Error", error=True), debug, transcript_handler, vad_state
         return
 
     transcript_handler.add_user(result.user_transcript)
