@@ -1,0 +1,10 @@
+services:
+  voicechatbot:
+    build: .
+    ports:
+      - "7860:7860"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    volumes:
+      - .:/app
+    restart: unless-stopped

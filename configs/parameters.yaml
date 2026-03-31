@@ -1,0 +1,21 @@
+app:
+  host: "0.0.0.0"
+  port: 7860
+  debug: false
+
+live_api:
+  model: "gemini-3.1-flash-live-preview"
+  voice: "Aoede"
+  input_sample_rate: 16000
+  output_sample_rate: 24000
+  response_modalities:
+    - "AUDIO"
+  enable_input_transcription: true
+  enable_output_transcription: true
+
+orchestration:
+  model: "gemini-3.1-flash-lite-preview"  # Phase 2
+
+session:
+  max_duration_seconds: 900  # 15 min (Live API limit without compression)
+  reconnect_max_retries: 1
