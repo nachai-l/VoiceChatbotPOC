@@ -9,7 +9,13 @@ Run with Docker:
     docker compose up --build
 """
 
+import logging
 import yaml
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 from app.ui.gradio_app import create_app
 

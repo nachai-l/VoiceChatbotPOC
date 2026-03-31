@@ -7,19 +7,24 @@ State machine:
   silence   — energy below threshold after speech, counting down
   → send    — silence counter hits threshold, caller should send buffer
 
-Tuning constants (adjust based on microphone gain and environment):
-  SPEECH_ENERGY_THRESHOLD  — RMS level that counts as speech
-  SILENCE_CHUNKS_TO_TRIGGER — consecutive silent chunks before sending (~1.5 s at 0.25 s/chunk)
-  MIN_SPEECH_CHUNKS         — minimum speech chunks to reject noise clicks
+Tuning notes:
+  - Lower threshold because real browser/mic RMS is much lower than expected.
+  - Require only 1 speech chunk so short follow-up utterances are not dropped.
+  - Keep a short silence window so turn-taking still feels responsive.
 """
 
 from dataclasses import dataclass, field
 
 import numpy as np
 
-SPEECH_ENERGY_THRESHOLD: float = 0.01
-SILENCE_CHUNKS_TO_TRIGGER: int = 6   # 6 × 0.25 s = 1.5 s of silence
-MIN_SPEECH_CHUNKS: int = 2           # ~0.5 s minimum utterance
+# Lower than before because observed real RMS was around 0.0045
+SPEECH_ENERGY_THRESHOLD: float = 0.006
+
+# 4 × 0.25 s = 1.0 s silence before sending
+SILENCE_CHUNKS_TO_TRIGGER: int = 4
+
+# Allow shorter follow-up turns
+MIN_SPEECH_CHUNKS: int = 1
 
 
 @dataclass
@@ -29,13 +34,21 @@ class VADState:
     silence_chunks: int = 0
     speech_chunks: int = 0
     is_speaking: bool = False
+    pending_task: object = None  # asyncio.Task for in-flight API call
 
 
 def compute_rms(data: np.ndarray) -> float:
-    """Return the RMS energy of an audio chunk."""
-    if len(data) == 0:
+    """Return RMS energy normalized to [0.0, 1.0]."""
+    if data is None or len(data) == 0:
         return 0.0
-    return float(np.sqrt(np.mean(data.astype(np.float32) ** 2)))
+
+    arr = np.asarray(data, dtype=np.float32)
+
+    # Normalize int16-style inputs
+    if np.max(np.abs(arr)) > 1.0:
+        arr = arr / 32768.0
+
+    return float(np.sqrt(np.mean(arr ** 2)))
 
 
 def process_chunk(
@@ -45,8 +58,6 @@ def process_chunk(
 
     Returns:
         (updated_state, should_send)
-        should_send=True means an utterance ended — caller should read the buffer,
-        send it to the Live API, then call reset_vad().
     """
     state.buffer_sr = sample_rate
     rms = compute_rms(chunk)
@@ -58,12 +69,13 @@ def process_chunk(
         state.buffer_chunks.append(chunk)
         return state, False
 
-    # Silent chunk
+    # Silent chunk before speech starts: ignore
     if not state.is_speaking:
         return state, False
 
+    # Silent chunk after speech started: keep it for natural cadence
     state.silence_chunks += 1
-    state.buffer_chunks.append(chunk)  # keep trailing silence for natural cadence
+    state.buffer_chunks.append(chunk)
 
     if (
         state.silence_chunks >= SILENCE_CHUNKS_TO_TRIGGER
@@ -75,7 +87,7 @@ def process_chunk(
 
 
 def get_buffer_array(state: VADState) -> np.ndarray | None:
-    """Concatenate all buffered chunks into a single numpy array, or None if empty."""
+    """Concatenate all buffered chunks into a single array, or None if empty."""
     if not state.buffer_chunks:
         return None
     return np.concatenate(state.buffer_chunks)

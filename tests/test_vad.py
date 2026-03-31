@@ -52,6 +52,19 @@ class TestComputeRms:
     def test_empty_array_returns_zero(self):
         assert compute_rms(np.array([], dtype=np.float32)) == 0.0
 
+    def test_int16_normalized_same_as_float32(self):
+        """Regression: Gradio streaming sends int16 — RMS must normalize to [0,1]."""
+        float_data = _speech_chunk(amplitude=0.5)
+        int16_data = (float_data * 32767).astype(np.int16)
+        rms_float = compute_rms(float_data)
+        rms_int16 = compute_rms(int16_data)
+        assert rms_int16 == pytest.approx(rms_float, abs=0.01)
+
+    def test_int16_silence_below_threshold(self):
+        """Regression: int16 silence must have RMS near 0 (not 250+)."""
+        silence = np.zeros(4000, dtype=np.int16)
+        assert compute_rms(silence) == pytest.approx(0.0)
+
 
 # ---------------------------------------------------------------------------
 # process_chunk — state transitions
@@ -168,3 +181,41 @@ class TestResetVad:
         state = VADState(buffer_sr=44100)
         state = reset_vad(state)
         assert state.buffer_sr == 44100
+
+
+# ---------------------------------------------------------------------------
+# VAD constants sanity checks
+# ---------------------------------------------------------------------------
+
+class TestVADConstants:
+    """Regression: constants must stay in sync with tuned values."""
+
+    def test_speech_threshold_is_low_enough_for_real_mic(self):
+        """Observed real browser mic RMS during speech is ~0.004–0.01."""
+        assert SPEECH_ENERGY_THRESHOLD <= 0.01
+
+    def test_silence_trigger_gives_responsive_turn_taking(self):
+        """4 chunks × 0.25s = 1.0s — must be <= 1.5s for conversational feel."""
+        assert SILENCE_CHUNKS_TO_TRIGGER * 0.25 <= 1.5
+
+    def test_min_speech_chunks_allows_short_utterances(self):
+        """MIN_SPEECH_CHUNKS=1 allows short follow-up replies like 'yes'."""
+        assert MIN_SPEECH_CHUNKS >= 1
+        assert MIN_SPEECH_CHUNKS <= 2
+
+
+# ---------------------------------------------------------------------------
+# VADState.pending_task field
+# ---------------------------------------------------------------------------
+
+class TestVADStatePendingTask:
+    def test_default_pending_task_is_none(self):
+        state = VADState()
+        assert state.pending_task is None
+
+    def test_reset_clears_pending_task(self):
+        """reset_vad creates a fresh state; pending_task must be None."""
+        state = VADState()
+        state.pending_task = "some_task"
+        state = reset_vad(state)
+        assert state.pending_task is None

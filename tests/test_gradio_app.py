@@ -4,16 +4,31 @@ Tests for gradio_app.py event handlers.
 Covers:
   - handle_voice_turn: async generator contract + early exits (kept for regression)
   - stream_audio_chunk: VAD-driven streaming handler
+  - poll_pending_result: timer-driven completion path
+  - _build_audio_output: WAV file creation and gain/normalization
+  - _consume_finished_task: background task result handling
   - handle_clear: session reset
   - create_app: Gradio 6.x API compatibility
 """
+
+import asyncio
+import time
 
 import numpy as np
 import pytest
 
 from app.live.transcript_handler import TranscriptHandler
 from app.live.vad import VADState, SILENCE_CHUNKS_TO_TRIGGER, MIN_SPEECH_CHUNKS
-from app.ui.gradio_app import handle_voice_turn, handle_clear, stream_audio_chunk
+from app.ui.gradio_app import (
+    handle_voice_turn,
+    handle_clear,
+    stream_audio_chunk,
+    poll_pending_result,
+    _build_audio_output,
+    _consume_finished_task,
+    _new_vad_state,
+    PLAYBACK_COOLDOWN_SECONDS,
+)
 
 SR = 16000
 CHUNK = SR // 4  # 0.25 s
@@ -97,70 +112,88 @@ class TestHandleVoiceTurnEarlyExits:
 # stream_audio_chunk — VAD streaming handler
 # ---------------------------------------------------------------------------
 
-class TestAudioOutputNotCleared:
-    """Regression: audio_output must never be set to None on non-audio yields.
+class TestStreamDoesNotOutputAudio:
+    """Regression: stream_audio_chunk must NOT output to audio_output.
 
-    Setting None on gr.Audio clears/stops any currently playing audio.
-    Use gr.update() (no-op) instead so the assistant response keeps playing
-    while silence chunks continue to stream in.
+    Audio playback is owned exclusively by poll_pending_result.
+    The stream handler outputs 5 values (no audio) to avoid rapid
+    re-renders that kill the audio player before it can play.
     """
 
     @pytest.mark.anyio
-    async def test_none_chunk_does_not_yield_none_audio(self, handler, vad):
-        import gradio as gr
-        results = await _collect(stream_audio_chunk(None, [], handler, vad))
-        audio_out, _, _, _, _, _ = results[0]
-        assert isinstance(audio_out, gr.components.base.Component) or hasattr(audio_out, "__class__") and "update" in str(type(audio_out)).lower() or audio_out != None or True
-        # The real assertion: audio_out must NOT be None
-        assert audio_out is not None, (
-            "audio_output must be gr.update(), not None — "
-            "returning None clears playing audio on every 0.25s stream tick."
-        )
+    async def test_stream_yields_5_values_not_6(self, handler, vad):
+        results = await _collect(stream_audio_chunk(None, handler, vad))
+        assert len(results[0]) == 5  # no audio_output in the tuple
 
     @pytest.mark.anyio
-    async def test_silence_chunk_does_not_yield_none_audio(self, handler, vad):
+    async def test_silence_chunk_yields_5_values(self, handler, vad):
         sr, data = _silence_chunk()
-        results = await _collect(stream_audio_chunk((sr, data), [], handler, vad))
-        audio_out, _, _, _, _, _ = results[0]
-        assert audio_out is not None
+        results = await _collect(stream_audio_chunk((sr, data), handler, vad))
+        assert len(results[0]) == 5
 
     @pytest.mark.anyio
-    async def test_speech_chunk_does_not_yield_none_audio(self, handler, vad):
+    async def test_speech_chunk_yields_5_values(self, handler, vad):
         sr, data = _speech_chunk()
-        results = await _collect(stream_audio_chunk((sr, data), [], handler, vad))
-        audio_out, _, _, _, _, _ = results[0]
-        assert audio_out is not None
+        results = await _collect(stream_audio_chunk((sr, data), handler, vad))
+        assert len(results[0]) == 5
 
 
 class TestStreamAudioChunkIsAsyncGenerator:
     @pytest.mark.anyio
     async def test_is_async_generator(self, handler, vad):
         import inspect
-        result = stream_audio_chunk(None, [], handler, vad)
+        result = stream_audio_chunk(None, handler, vad)
         assert inspect.isasyncgen(result)
 
     @pytest.mark.anyio
     async def test_none_chunk_yields_listening_status(self, handler, vad):
-        results = await _collect(stream_audio_chunk(None, [], handler, vad))
+        results = await _collect(stream_audio_chunk(None, handler, vad))
         assert len(results) == 1
-        _, _, status, _, _, _ = results[0]
+        _, status, _, _, _ = results[0]
         assert "Listening" in status
 
     @pytest.mark.anyio
     async def test_empty_data_yields_listening_status(self, handler, vad):
         audio = (SR, np.array([], dtype=np.float32))
-        results = await _collect(stream_audio_chunk(audio, [], handler, vad))
-        _, _, status, _, _, _ = results[0]
+        results = await _collect(stream_audio_chunk(audio, handler, vad))
+        _, status, _, _, _ = results[0]
         assert "Listening" in status
+
+
+async def _trigger_vad(handler, vad, monkeypatch, mock_send_turn):
+    """Helper: feed speech + silence to fire the VAD, then poll until the task completes."""
+    import app.ui.gradio_app as module
+    monkeypatch.setattr(module, "send_turn", mock_send_turn)
+
+    # Feed speech chunks (stream yields 5 values: history, status, debug, handler, vad)
+    for _ in range(MIN_SPEECH_CHUNKS):
+        sr, data = _speech_chunk()
+        async for item in stream_audio_chunk((sr, data), handler, vad):
+            _, _, _, _, vad = item
+
+    # Feed silence to trigger VAD → launches background task
+    for _ in range(SILENCE_CHUNKS_TO_TRIGGER):
+        sr, data = _silence_chunk()
+        async for item in stream_audio_chunk((sr, data), handler, vad):
+            _, _, _, _, vad = item
+
+    # Let the background task finish
+    if vad.pending_task:
+        await vad.pending_task
+
+    # Collect the result using the timer-based poller (returns 6 values including audio)
+    final_result = await poll_pending_result(handler, vad)
+    _, _, _, _, _, vad = final_result
+    return [final_result], vad
 
 
 class TestStreamAudioChunkVADIntegration:
     @pytest.mark.anyio
     async def test_speech_chunk_yields_speaking_status(self, handler, vad):
         sr, data = _speech_chunk()
-        results = await _collect(stream_audio_chunk((sr, data), [], handler, vad))
-        _, _, status, _, _, _ = results[-1]
-        assert "Speaking" in status or "Thinking" in status  # either is valid mid-stream
+        results = await _collect(stream_audio_chunk((sr, data), handler, vad))
+        _, status, _, _, _ = results[-1]
+        assert "Speaking" in status or "Thinking" in status
 
     @pytest.mark.anyio
     async def test_no_api_call_during_speech_only(self, handler, vad, monkeypatch):
@@ -172,13 +205,13 @@ class TestStreamAudioChunkVADIntegration:
             nonlocal call_count
             call_count += 1
             from app.live.live_session_manager import LiveSessionResult
-            return LiveSessionResult(b"\x00", "u", "a")
+            return LiveSessionResult(b"\x00\x00", "u", "a")
 
         monkeypatch.setattr(module, "send_turn", mock_send_turn)
 
         for _ in range(MIN_SPEECH_CHUNKS + 1):
             sr, data = _speech_chunk()
-            async for _ in stream_audio_chunk((sr, data), [], handler, vad):
+            async for _ in stream_audio_chunk((sr, data), handler, vad):
                 pass
 
         assert call_count == 0
@@ -186,7 +219,6 @@ class TestStreamAudioChunkVADIntegration:
     @pytest.mark.anyio
     async def test_api_called_after_speech_then_silence(self, handler, vad, monkeypatch):
         """Live API must be called exactly once after enough silence follows speech."""
-        import app.ui.gradio_app as module
         call_count = 0
 
         async def mock_send_turn(pcm):
@@ -195,96 +227,60 @@ class TestStreamAudioChunkVADIntegration:
             from app.live.live_session_manager import LiveSessionResult
             return LiveSessionResult(b"\x00\x01", "what is my balance", "Your balance is 100.")
 
-        monkeypatch.setattr(module, "send_turn", mock_send_turn)
-
-        # Enough speech
-        for _ in range(MIN_SPEECH_CHUNKS):
-            sr, data = _speech_chunk()
-            async for _ in stream_audio_chunk((sr, data), [], handler, vad):
-                pass
-
-        # Enough silence to trigger
-        for _ in range(SILENCE_CHUNKS_TO_TRIGGER):
-            sr, data = _silence_chunk()
-            async for _ in stream_audio_chunk((sr, data), [], handler, vad):
-                pass
-
+        await _trigger_vad(handler, vad, monkeypatch, mock_send_turn)
         assert call_count == 1
 
     @pytest.mark.anyio
     async def test_transcripts_added_after_successful_turn(self, handler, vad, monkeypatch):
-        import app.ui.gradio_app as module
         from app.live.live_session_manager import LiveSessionResult
 
         async def mock_send_turn(pcm):
             return LiveSessionResult(b"\x00\x01", "what is my balance", "Your balance is 200.")
 
-        monkeypatch.setattr(module, "send_turn", mock_send_turn)
-
-        for _ in range(MIN_SPEECH_CHUNKS):
-            sr, data = _speech_chunk()
-            async for _ in stream_audio_chunk((sr, data), [], handler, vad):
-                pass
-
-        final_results = []
-        for _ in range(SILENCE_CHUNKS_TO_TRIGGER):
-            sr, data = _silence_chunk()
-            async for item in stream_audio_chunk((sr, data), [], handler, vad):
-                final_results.append(item)
-
-        _, history, _, _, _, _ = final_results[-1]
+        results, _ = await _trigger_vad(handler, vad, monkeypatch, mock_send_turn)
+        _, history, _, _, _, _ = results[-1]
         roles = [m["role"] for m in history]
         assert "user" in roles
         assert "assistant" in roles
 
     @pytest.mark.anyio
     async def test_error_result_shown_in_status(self, handler, vad, monkeypatch):
-        import app.ui.gradio_app as module
         from app.live.live_session_manager import LiveSessionResult
 
         async def mock_send_turn(pcm):
             return LiveSessionResult(b"", "", "", error="timeout")
 
-        monkeypatch.setattr(module, "send_turn", mock_send_turn)
-
-        for _ in range(MIN_SPEECH_CHUNKS):
-            sr, data = _speech_chunk()
-            async for _ in stream_audio_chunk((sr, data), [], handler, vad):
-                pass
-
-        final_results = []
-        for _ in range(SILENCE_CHUNKS_TO_TRIGGER):
-            sr, data = _silence_chunk()
-            async for item in stream_audio_chunk((sr, data), [], handler, vad):
-                final_results.append(item)
-
-        _, _, status, debug, _, _ = final_results[-1]
-        assert "Error" in status
+        results, _ = await _trigger_vad(handler, vad, monkeypatch, mock_send_turn)
+        _, _, status, debug, _, _ = results[-1]
+        assert "warning" in status.lower()
         assert "timeout" in debug.get("error", "")
 
     @pytest.mark.anyio
     async def test_vad_resets_after_send(self, handler, vad, monkeypatch):
         """After an utterance is sent, VAD state resets so next utterance is independent."""
-        import app.ui.gradio_app as module
         from app.live.live_session_manager import LiveSessionResult
 
         async def mock_send_turn(pcm):
-            return LiveSessionResult(b"\x00\x00", "hi", "hello")  # 2 bytes = valid int16
+            return LiveSessionResult(b"\x00\x00", "hi", "hello")
 
-        monkeypatch.setattr(module, "send_turn", mock_send_turn)
-
-        for _ in range(MIN_SPEECH_CHUNKS):
-            sr, data = _speech_chunk()
-            async for _ in stream_audio_chunk((sr, data), [], handler, vad):
-                pass
-
-        for _ in range(SILENCE_CHUNKS_TO_TRIGGER):
-            sr, data = _silence_chunk()
-            async for item in stream_audio_chunk((sr, data), [], handler, vad):
-                _, _, _, _, _, vad = item  # pick up updated vad state
-
+        _, vad = await _trigger_vad(handler, vad, monkeypatch, mock_send_turn)
         assert not vad.is_speaking
         assert vad.buffer_chunks == []
+
+
+# ---------------------------------------------------------------------------
+# poll_pending_result
+# ---------------------------------------------------------------------------
+
+class TestPollPendingResult:
+    @pytest.mark.anyio
+    async def test_no_task_returns_no_updates(self, handler, vad):
+        audio_out, history, status, debug, _, _ = await poll_pending_result(handler, vad)
+        assert audio_out is not None
+        assert history == []
+        # status/debug are intentionally gr.update() when idle
+        assert status is not None
+        assert debug is not None
 
 
 # ---------------------------------------------------------------------------
@@ -292,19 +288,27 @@ class TestStreamAudioChunkVADIntegration:
 # ---------------------------------------------------------------------------
 
 class TestHandleClear:
-    def test_clear_returns_empty_history(self, handler):
+    def test_clear_returns_empty_history(self, handler, vad):
         handler.add_user("hello")
-        history, _, _, _ = handle_clear(handler)
+        history, _, _, _, _, _ = handle_clear(handler, vad)
         assert history == []
 
-    def test_clear_returns_ready_status(self, handler):
-        _, status, _, _ = handle_clear(handler)
+    def test_clear_returns_ready_status(self, handler, vad):
+        _, _, status, _, _, _ = handle_clear(handler, vad)
         assert "Ready" in status or "cleared" in status.lower()
 
-    def test_clear_resets_transcript_handler(self, handler):
+    def test_clear_resets_transcript_handler(self, handler, vad):
         handler.add_user("hello")
-        _, _, _, returned_handler = handle_clear(handler)
+        _, _, _, _, returned_handler, _ = handle_clear(handler, vad)
         assert returned_handler.get_history() == []
+
+    def test_clear_resets_vad_state(self, handler, vad):
+        vad.is_speaking = True
+        vad.buffer_chunks = [np.ones(CHUNK, dtype=np.float32)]
+        _, _, _, _, _, returned_vad = handle_clear(handler, vad)
+        assert returned_vad.buffer_chunks == []
+        assert returned_vad.is_speaking is False
+        assert returned_vad.pending_task is None
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +318,6 @@ class TestHandleClear:
 class TestCreateApp:
     def test_create_app_does_not_raise(self):
         from app.ui.gradio_app import create_app
-        import gradio as gr
         demo = create_app()
         assert demo is not None
 
@@ -347,3 +350,216 @@ class TestCreateApp:
         src = inspect.getsource(module.create_app)
         assert "streaming=True" in src, "audio_input must set streaming=True"
         assert "recording=True" in src, "audio_input must set recording=True"
+
+    def test_timer_is_present_for_result_polling(self):
+        import inspect
+        import app.ui.gradio_app as module
+        src = inspect.getsource(module.create_app)
+        assert "gr.Timer(" in src
+        assert ".tick(" in src
+
+    def test_audio_output_type_is_numpy(self):
+        """Regression: audio output must use type='numpy' to match tuple returns."""
+        import inspect
+        import app.ui.gradio_app as module
+        src = inspect.getsource(module.create_app)
+        assert 'type="numpy"' in src
+
+    def test_stream_handler_does_not_output_to_audio(self):
+        """Regression: stream_audio_chunk must NOT write to audio_output.
+
+        Audio is owned by the poller to prevent rapid re-renders that
+        kill audio playback before it starts.
+        """
+        import inspect
+        import app.ui.gradio_app as module
+        src = inspect.getsource(module.create_app)
+        # Find the audio_input.stream() call and check audio_output is not in its outputs
+        lines = src.split("\n")
+        in_stream_block = False
+        for line in lines:
+            if "audio_input.stream(" in line:
+                in_stream_block = True
+            if in_stream_block and "outputs=" in line:
+                assert "audio_output" not in line
+                break
+
+
+# ---------------------------------------------------------------------------
+# _build_audio_output — numpy tuple creation
+# ---------------------------------------------------------------------------
+
+class TestBuildAudioOutput:
+    def test_empty_bytes_returns_gr_update(self):
+        result = _build_audio_output(b"")
+        # gr.update() is not a tuple
+        assert not isinstance(result, tuple)
+
+    def test_valid_pcm_returns_numpy_tuple(self):
+        # 0.1s of 24kHz silence = 2400 samples × 2 bytes = 4800 bytes
+        pcm = np.zeros(2400, dtype=np.int16).tobytes()
+        result = _build_audio_output(pcm)
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        sr, data = result
+        assert sr == 24000
+        assert isinstance(data, np.ndarray)
+        assert len(data) == 2400
+
+    def test_playback_gain_is_applied(self):
+        """Audio should be louder than raw PCM (gain > 1.0)."""
+        from app.ui.gradio_app import PLAYBACK_GAIN
+        assert PLAYBACK_GAIN > 1.0
+
+        # Quiet audio: 0.1 amplitude → int16 ~3277
+        amplitude = 0.1
+        float_samples = np.ones(2400, dtype=np.float32) * amplitude
+        pcm = (float_samples * 32767).astype(np.int16).tobytes()
+        sr, data = _build_audio_output(pcm)
+        # After gain of 2.5, peak should be ~0.25
+        peak = float(np.max(np.abs(data)))
+        assert peak > amplitude  # gain was applied
+
+
+# ---------------------------------------------------------------------------
+# _consume_finished_task
+# ---------------------------------------------------------------------------
+
+class TestConsumeFinishedTask:
+    @pytest.mark.anyio
+    async def test_successful_task_returns_audio_and_transcripts(self, handler):
+        from app.live.live_session_manager import LiveSessionResult
+
+        vad = _new_vad_state()
+        future = asyncio.get_event_loop().create_future()
+        future.set_result(LiveSessionResult(b"\x00\x02" * 1200, "hello", "hi there"))
+        vad.pending_task = future
+
+        audio_out, history, status, debug, _, returned_vad = _consume_finished_task(handler, vad)
+        assert isinstance(audio_out, tuple)  # (sample_rate, numpy_array)
+        assert len(audio_out) == 2
+        assert returned_vad.pending_task is None
+        assert debug["ok"] is True
+        assert "Playing" in status
+
+    @pytest.mark.anyio
+    async def test_error_task_shows_error_status(self, handler):
+        from app.live.live_session_manager import LiveSessionResult
+
+        vad = _new_vad_state()
+        future = asyncio.get_event_loop().create_future()
+        future.set_result(LiveSessionResult(b"", "", "", error="API timeout"))
+        vad.pending_task = future
+
+        audio_out, history, status, debug, _, returned_vad = _consume_finished_task(handler, vad)
+        assert "warning" in status.lower() or "Error" in status
+        assert debug["error"] == "API timeout"
+        assert returned_vad.pending_task is None
+
+    @pytest.mark.anyio
+    async def test_clears_pending_task_after_consume(self, handler):
+        from app.live.live_session_manager import LiveSessionResult
+
+        vad = _new_vad_state()
+        future = asyncio.get_event_loop().create_future()
+        future.set_result(LiveSessionResult(b"\x00\x00", "hi", "hello"))
+        vad.pending_task = future
+
+        _, _, _, _, _, returned_vad = _consume_finished_task(handler, vad)
+        assert returned_vad.pending_task is None
+
+    @pytest.mark.anyio
+    async def test_sets_cooldown_when_audio_present(self, handler):
+        from app.live.live_session_manager import LiveSessionResult
+
+        vad = _new_vad_state()
+        future = asyncio.get_event_loop().create_future()
+        future.set_result(LiveSessionResult(b"\x00\x02" * 100, "hi", "hello"))
+        vad.pending_task = future
+
+        before = time.monotonic()
+        _, _, _, _, _, returned_vad = _consume_finished_task(handler, vad)
+        ignore_until = getattr(returned_vad, "ignore_until", 0.0)
+        assert ignore_until > before
+
+
+# ---------------------------------------------------------------------------
+# _new_vad_state
+# ---------------------------------------------------------------------------
+
+class TestNewVadState:
+    def test_has_ignore_until_attribute(self):
+        state = _new_vad_state()
+        assert hasattr(state, "ignore_until")
+        assert getattr(state, "ignore_until") == 0.0
+
+    def test_pending_task_is_none(self):
+        state = _new_vad_state()
+        assert state.pending_task is None
+
+
+# ---------------------------------------------------------------------------
+# poll_pending_result — expanded coverage
+# ---------------------------------------------------------------------------
+
+class TestPollPendingResultExpanded:
+    @pytest.mark.anyio
+    async def test_returns_thinking_when_task_pending(self, handler):
+        vad = _new_vad_state()
+        vad.pending_task = asyncio.get_event_loop().create_future()  # not done yet
+
+        audio_out, history, status, debug, _, _ = await poll_pending_result(handler, vad)
+        assert "Thinking" in status
+        assert debug.get("waiting") is True
+
+        # Cancel the future to avoid warning
+        vad.pending_task.cancel()
+
+    @pytest.mark.anyio
+    async def test_returns_result_when_task_done(self, handler):
+        from app.live.live_session_manager import LiveSessionResult
+
+        vad = _new_vad_state()
+        future = asyncio.get_event_loop().create_future()
+        future.set_result(LiveSessionResult(b"\x00\x02" * 100, "test", "response"))
+        vad.pending_task = future
+
+        audio_out, history, status, debug, _, returned_vad = await poll_pending_result(handler, vad)
+        assert returned_vad.pending_task is None
+        assert debug["ok"] is True
+
+    @pytest.mark.anyio
+    async def test_shows_cooldown_during_playback(self, handler):
+        vad = _new_vad_state()
+        setattr(vad, "ignore_until", time.monotonic() + 5.0)  # 5s in the future
+
+        audio_out, _, status, debug, _, _ = await poll_pending_result(handler, vad)
+        assert "Playing" in status
+        assert "cooldown_s" in debug
+
+
+# ---------------------------------------------------------------------------
+# stream_audio_chunk — cooldown behavior
+# ---------------------------------------------------------------------------
+
+class TestStreamAudioChunkCooldown:
+    @pytest.mark.anyio
+    async def test_ignores_input_during_cooldown(self, handler):
+        vad = _new_vad_state()
+        setattr(vad, "ignore_until", time.monotonic() + 5.0)
+
+        sr, data = _speech_chunk()
+        results = await _collect(stream_audio_chunk((sr, data), handler, vad))
+        _, status, debug, _, _ = results[0]
+        assert "Playing" in status
+        assert "cooldown_s" in debug
+
+    @pytest.mark.anyio
+    async def test_resumes_listening_after_cooldown(self, handler):
+        vad = _new_vad_state()
+        setattr(vad, "ignore_until", time.monotonic() - 1.0)  # Already expired
+
+        sr, data = _silence_chunk()
+        results = await _collect(stream_audio_chunk((sr, data), handler, vad))
+        _, status, _, _, _ = results[0]
+        assert "Listening" in status
