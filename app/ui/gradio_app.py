@@ -42,9 +42,7 @@ def _new_transcript_handler() -> TranscriptHandler:
 
 
 def _new_vad_state() -> VADState:
-    state = VADState()
-    setattr(state, "ignore_until", 0.0)
-    return state
+    return VADState()
 
 
 # ---------------------------------------------------------------------------
@@ -113,10 +111,12 @@ def _consume_finished_task(
 
     audio_output = _build_audio_output(result.audio_bytes)
 
-    # Short cooldown so the always-on mic does not instantly retrigger
-    # while response playback begins or while residual noise is present.
+    # Cooldown: covers the actual playback duration plus a short buffer so the
+    # always-on mic does not re-trigger while the response is still playing.
+    # Fixed 0.75 s was too short for responses longer than ~1 s.
     if result.audio_bytes:
-        setattr(vad_state, "ignore_until", time.monotonic() + PLAYBACK_COOLDOWN_SECONDS)
+        audio_duration_s = len(result.audio_bytes) / (DEFAULT_OUTPUT_SAMPLE_RATE * 2)
+        vad_state.ignore_until = time.monotonic() + audio_duration_s + PLAYBACK_COOLDOWN_SECONDS
 
     debug = {
         "turn": "direct_conversation",
@@ -160,13 +160,12 @@ async def stream_audio_chunk(
         return
 
     # Short cooldown right after assistant audio is returned.
-    ignore_until = float(getattr(vad_state, "ignore_until", 0.0) or 0.0)
     now = time.monotonic()
-    if now < ignore_until:
+    if now < vad_state.ignore_until:
         yield (
             history,
             _status("Playing response..."),
-            {"cooldown_s": round(ignore_until - now, 2)},
+            {"cooldown_s": round(vad_state.ignore_until - now, 2)},
             transcript_handler,
             vad_state,
         )
@@ -197,7 +196,6 @@ async def stream_audio_chunk(
     audio_array = get_buffer_array(vad_state)
     pcm_bytes = numpy_to_pcm16(sample_rate, audio_array)
     vad_state = reset_vad(vad_state)
-    setattr(vad_state, "ignore_until", 0.0)
     vad_state.pending_task = asyncio.create_task(send_turn(pcm_bytes))
     logger.info("VAD triggered — launched API task (%d PCM bytes)", len(pcm_bytes))
 
@@ -212,16 +210,24 @@ async def poll_pending_result(
     NO_AUDIO = gr.update()
 
     if vad_state.pending_task is None:
-        ignore_until = float(getattr(vad_state, "ignore_until", 0.0) or 0.0)
-        if time.monotonic() < ignore_until:
+        if time.monotonic() < vad_state.ignore_until:
             return (
                 NO_AUDIO,
                 transcript_handler.get_history(),
                 _status("Playing response..."),
-                {"cooldown_s": round(ignore_until - time.monotonic(), 2)},
+                {"cooldown_s": round(vad_state.ignore_until - time.monotonic(), 2)},
                 transcript_handler,
                 vad_state,
             )
+
+        # Cooldown expired and no task in flight.
+        # Explicitly set "Listening..." when idle so the status never gets
+        # stuck on "Playing response..." if the browser paused the mic stream
+        # during audio playback (which prevents stream_audio_chunk from firing).
+        # When the VAD is actively accumulating speech the stream handler owns
+        # the status, so we leave it alone to avoid overwriting "Speaking...".
+        if not vad_state.is_speaking:
+            return NO_AUDIO, transcript_handler.get_history(), _status("Listening..."), {}, transcript_handler, vad_state
 
         return NO_AUDIO, transcript_handler.get_history(), gr.update(), gr.update(), transcript_handler, vad_state
 
@@ -289,8 +295,6 @@ def handle_clear(transcript_handler: TranscriptHandler, vad_state: VADState) -> 
     """Reset the session."""
     transcript_handler.clear()
     vad_state = reset_vad(vad_state)
-    setattr(vad_state, "ignore_until", 0.0)
-    vad_state.pending_task = None
     return [], None, _status("Session cleared — ready"), {}, transcript_handler, vad_state
 
 

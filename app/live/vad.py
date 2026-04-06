@@ -35,6 +35,7 @@ class VADState:
     speech_chunks: int = 0
     is_speaking: bool = False
     pending_task: object = None  # asyncio.Task for in-flight API call
+    ignore_until: float = 0.0   # monotonic timestamp: ignore mic input until this time
 
 
 def compute_rms(data: np.ndarray) -> float:

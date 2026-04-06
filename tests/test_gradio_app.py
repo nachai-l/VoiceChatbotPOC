@@ -274,13 +274,14 @@ class TestStreamAudioChunkVADIntegration:
 
 class TestPollPendingResult:
     @pytest.mark.anyio
-    async def test_no_task_returns_no_updates(self, handler, vad):
+    async def test_no_task_returns_listening_status(self, handler, vad):
         audio_out, history, status, debug, _, _ = await poll_pending_result(handler, vad)
         assert audio_out is not None
         assert history == []
-        # status/debug are intentionally gr.update() when idle
-        assert status is not None
-        assert debug is not None
+        # When truly idle (no task, no cooldown, not speaking) the poller must
+        # explicitly return "Listening..." to prevent the stuck-state bug.
+        assert "Listening" in status
+        assert debug == {}
 
 
 # ---------------------------------------------------------------------------
@@ -536,6 +537,141 @@ class TestPollPendingResultExpanded:
         audio_out, _, status, debug, _, _ = await poll_pending_result(handler, vad)
         assert "Playing" in status
         assert "cooldown_s" in debug
+
+
+# ---------------------------------------------------------------------------
+# poll_pending_result — idle transition (Bug 1 regression)
+# ---------------------------------------------------------------------------
+
+class TestPollIdleTransition:
+    """Regression: after cooldown expires with no pending task, the poller must
+    explicitly return 'Listening...' so the UI never gets stuck on
+    'Playing response...' when the browser pauses the mic stream during playback."""
+
+    @pytest.mark.anyio
+    async def test_returns_listening_when_truly_idle(self, handler):
+        """No task, no cooldown → status must be 'Listening...' not gr.update()."""
+        vad = _new_vad_state()
+        _, _, status, debug, _, _ = await poll_pending_result(handler, vad)
+        assert isinstance(status, str), "status must be a string, not gr.update() no-op"
+        assert "Listening" in status
+
+    @pytest.mark.anyio
+    async def test_returns_listening_after_cooldown_expires(self, handler):
+        """Regression: stuck 'Playing response...' state.
+        After the cooldown expires the poller must push the UI back to 'Listening...'
+        even when the stream handler is not firing (mic paused by browser)."""
+        vad = _new_vad_state()
+        vad.ignore_until = time.monotonic() - 1.0  # already expired
+
+        _, _, status, debug, _, _ = await poll_pending_result(handler, vad)
+        assert isinstance(status, str), "status must be explicit string, not gr.update()"
+        assert "Listening" in status
+        assert debug == {}
+
+    @pytest.mark.anyio
+    async def test_does_not_override_speaking_status(self, handler):
+        """When VAD is accumulating speech, the stream handler owns 'Speaking...' status.
+        The poller must not override it with 'Listening...' and cause visible flicker."""
+        import gradio as gr
+        vad = _new_vad_state()
+        vad.is_speaking = True  # stream handler is currently detecting speech
+
+        _, _, status, _, _, _ = await poll_pending_result(handler, vad)
+        # gr.update() is returned — it's not a plain string
+        assert not isinstance(status, str), (
+            "poller must return gr.update() (no-op) when stream is in speech mode "
+            "to avoid overwriting 'Speaking detected...' with 'Listening...'"
+        )
+
+
+# ---------------------------------------------------------------------------
+# _consume_finished_task — duration-based cooldown (Bug 2 regression)
+# ---------------------------------------------------------------------------
+
+class TestDurationBasedCooldown:
+    """Regression: fixed 0.75 s cooldown caused mic re-trigger during long responses.
+    Cooldown must now be: audio_duration + PLAYBACK_COOLDOWN_SECONDS."""
+
+    @pytest.mark.anyio
+    async def test_long_audio_gets_longer_cooldown_than_short(self, handler):
+        """A 3-second response must produce a longer cooldown than a 0.1-second response."""
+        from app.live.live_session_manager import LiveSessionResult
+
+        sr = 24000  # DEFAULT_OUTPUT_SAMPLE_RATE
+        bytes_per_sample = 2
+
+        # Short response: ~0.1 s of audio
+        short_pcm = bytes(sr * bytes_per_sample // 10)  # 0.1 s
+        # Long response: ~3 s of audio
+        long_pcm = bytes(sr * bytes_per_sample * 3)    # 3 s
+
+        def _cooldown_for(pcm: bytes) -> float:
+            vad = _new_vad_state()
+            fut = asyncio.get_event_loop().create_future()
+            fut.set_result(LiveSessionResult(pcm, "hi", "hello"))
+            vad.pending_task = fut
+            before = time.monotonic()
+            _consume_finished_task(handler, vad)
+            # ignore_until is set relative to before — return the delta
+            # We can't easily inspect vad after consume (it's returned), so
+            # re-run and capture the returned vad
+            vad2 = _new_vad_state()
+            fut2 = asyncio.get_event_loop().create_future()
+            fut2.set_result(LiveSessionResult(pcm, "hi", "hello"))
+            vad2.pending_task = fut2
+            t0 = time.monotonic()
+            _, _, _, _, _, returned_vad = _consume_finished_task(TranscriptHandler(), vad2)
+            return returned_vad.ignore_until - t0
+
+        short_cooldown = _cooldown_for(short_pcm)
+        long_cooldown = _cooldown_for(long_pcm)
+
+        assert long_cooldown > short_cooldown, (
+            f"Long audio ({len(long_pcm)} bytes) cooldown {long_cooldown:.2f}s must be "
+            f"greater than short audio ({len(short_pcm)} bytes) cooldown {short_cooldown:.2f}s"
+        )
+
+    @pytest.mark.anyio
+    async def test_cooldown_covers_audio_duration(self, handler):
+        """Cooldown must be at least as long as the audio duration."""
+        from app.live.live_session_manager import LiveSessionResult
+        from app.ui.gradio_app import PLAYBACK_COOLDOWN_SECONDS, DEFAULT_OUTPUT_SAMPLE_RATE
+
+        sr = DEFAULT_OUTPUT_SAMPLE_RATE
+        bps = 2  # int16
+        duration_s = 2.0
+        pcm = bytes(int(sr * bps * duration_s))
+
+        vad = _new_vad_state()
+        fut = asyncio.get_event_loop().create_future()
+        fut.set_result(LiveSessionResult(pcm, "hi", "hello"))
+        vad.pending_task = fut
+
+        t0 = time.monotonic()
+        _, _, _, _, _, returned_vad = _consume_finished_task(handler, vad)
+        cooldown_applied = returned_vad.ignore_until - t0
+
+        assert cooldown_applied >= duration_s, (
+            f"Cooldown {cooldown_applied:.2f}s must cover audio duration {duration_s}s"
+        )
+        assert cooldown_applied >= duration_s + PLAYBACK_COOLDOWN_SECONDS - 0.05  # small tolerance
+
+    @pytest.mark.anyio
+    async def test_empty_audio_no_cooldown_set(self, handler):
+        """Empty audio response (e.g. error/text-only) must not set a cooldown."""
+        from app.live.live_session_manager import LiveSessionResult
+
+        vad = _new_vad_state()
+        fut = asyncio.get_event_loop().create_future()
+        fut.set_result(LiveSessionResult(b"", "hi", ""))
+        vad.pending_task = fut
+
+        before = time.monotonic()
+        _, _, _, _, _, returned_vad = _consume_finished_task(handler, vad)
+        assert returned_vad.ignore_until <= before + 0.01, (
+            "No cooldown should be set when there are no audio bytes"
+        )
 
 
 # ---------------------------------------------------------------------------
