@@ -258,7 +258,25 @@ async def stream_audio_chunk(
         vad_state.pending_task = None
 
     if vad_state.pending_task is not None:
-        yield history, _status("Thinking..."), {"waiting": True}, transcript_handler, vad_state, session_state, summary_store
+        # CRITICAL: return gr.update() (no-op) for every gr.State output.
+        #
+        # Race condition: stream_audio_chunk fires every 0.25 s and, if it
+        # returns the actual vad_state here, it can OVERWRITE the State that
+        # poll_pending_result just wrote (pending_task=None, ignore_until=now+5).
+        # That reset causes _consume_finished_task to re-run on every tick,
+        # keeping ignore_until perpetually in the future → stuck "Playing response...".
+        #
+        # gr.update() tells Gradio "keep the stored value unchanged", so the
+        # poll handler's write always survives regardless of call ordering.
+        yield (
+            gr.update(),           # chatbot
+            _status("Thinking..."),
+            {"waiting": True},
+            gr.update(),           # transcript_state
+            gr.update(),           # vad_state  ← poll owns this while task runs
+            gr.update(),           # session_state
+            gr.update(),           # summary_state
+        )
         return
 
     now = time.monotonic()

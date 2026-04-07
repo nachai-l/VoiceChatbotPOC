@@ -160,6 +160,41 @@ class TestStreamAudioChunkIsAsyncGenerator:
         assert inspect.isasyncgen(result)
 
     @pytest.mark.anyio
+    async def test_thinking_path_yields_gr_update_for_state(self, handler, session, summary):
+        """Regression (Gradio State race — permanent 'Playing response...'):
+        when a task is pending, stream_audio_chunk MUST return gr.update() for
+        all gr.State outputs so that poll_pending_result's State write (which
+        clears pending_task and sets ignore_until) is never overwritten.
+
+        If stream returns actual vad_state in this path, Gradio picks whichever
+        handler finishes last; the stale vad_state with pending_task still set
+        wins the race, causing _consume_finished_task to re-run on every tick
+        and reset ignore_until indefinitely → stuck status.
+        """
+        import gradio
+
+        vad = _new_vad_state()
+        vad.pending_task = asyncio.get_event_loop().create_future()  # not done
+
+        results = await _collect(stream_audio_chunk(None, handler, vad, session, summary))
+        chatbot, status, debug, transcript, vad_out, session_out, summary_out = results[0]
+
+        # Status is a real string so the UI updates
+        assert "Thinking" in status
+
+        # ALL State outputs must be gr.update() no-ops so they never overwrite
+        # the poll handler's pending_task=None / ignore_until update.
+        def _is_gr_update(v):
+            return isinstance(v, dict) and v.get("__type__") == "update"
+
+        assert _is_gr_update(vad_out),     "vad_state must be gr.update() in Thinking path"
+        assert _is_gr_update(transcript),  "transcript_state must be gr.update() in Thinking path"
+        assert _is_gr_update(session_out), "session_state must be gr.update() in Thinking path"
+        assert _is_gr_update(summary_out), "summary_state must be gr.update() in Thinking path"
+
+        vad.pending_task.cancel()
+
+    @pytest.mark.anyio
     async def test_none_chunk_yields_listening_status(self, handler, vad, session, summary):
         results = await _collect(stream_audio_chunk(None, handler, vad, session, summary))
         assert len(results) == 1
