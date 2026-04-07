@@ -120,10 +120,13 @@ def _build_audio_html(audio_bytes: bytes) -> object:
     logger.info("_build_audio_html: %d samples, gain=%.1f", len(audio_np), PLAYBACK_GAIN)
     # Each response gets a unique element id so replacing it triggers autoplay.
     uid = int(time.monotonic() * 1000) % 1_000_000
+    # Use src= directly on <audio> (not a child <source>) for maximum browser
+    # compatibility.  Add controls so the user can manually play if autoplay is
+    # blocked by the browser's autoplay policy on subsequent turns.
     return (
-        f'<audio id="r{uid}" autoplay style="width:100%">'
-        f'<source src="data:audio/wav;base64,{b64}" type="audio/wav">'
-        f"</audio>"
+        f'<audio id="r{uid}" autoplay controls style="width:100%" '
+        f'src="data:audio/wav;base64,{b64}">'
+        f'</audio>'
     )
 
 
@@ -242,6 +245,11 @@ def _consume_finished_task(
         )
 
     audio_output = _build_audio_html(result.audio_bytes)
+    logger.info(
+        "_consume: audio_bytes=%d, audio_html_type=%s",
+        len(result.audio_bytes),
+        type(audio_output).__name__,
+    )
 
     # Duration-based cooldown — IDEMPOTENT via task._completed_at.
     #
@@ -340,10 +348,11 @@ async def stream_audio_chunk(
         # CRITICAL: return gr.update() for all gr.State outputs so that
         # poll_pending_result's State write (pending_task=None, ignore_until set)
         # is never overwritten by this handler's stale vad_state copy.
+        _append_trace(vad_state, {"src": "stream", "waiting": True})
         yield (
             gr.update(),           # chatbot — no change while thinking
             _status("Thinking..."),
-            _append_trace(vad_state, {"src": "stream", "waiting": True}),
+            gr.update(),           # debug_panel — poll updates it every 0.25s
             gr.update(),           # transcript_state ← poll owns this
             gr.update(),           # vad_state  ← poll owns this while task runs
             gr.update(),           # session_state
@@ -353,10 +362,11 @@ async def stream_audio_chunk(
 
     now = time.monotonic()
     if now < vad_state.ignore_until:
+        _append_trace(vad_state, {"src": "stream"})
         yield (
             gr.update(),           # chatbot — no change during playback
             _status("Playing response..."),
-            _append_trace(vad_state, {"src": "stream"}),
+            gr.update(),           # debug_panel — poll updates it every 0.25s
             transcript_handler,
             vad_state,
             session_state,
@@ -365,12 +375,14 @@ async def stream_audio_chunk(
         return
 
     if chunk is None:
-        yield gr.update(), _status("Listening..."), _append_trace(vad_state, {"src": "stream", "chunk_none": True}), transcript_handler, vad_state, session_state, summary_store
+        _append_trace(vad_state, {"src": "stream", "chunk_none": True})
+        yield gr.update(), _status("Listening..."), gr.update(), transcript_handler, vad_state, session_state, summary_store
         return
 
     sample_rate, data = chunk
     if data is None or len(data) == 0:
-        yield gr.update(), _status("Listening..."), _append_trace(vad_state, {"src": "stream", "chunk_empty": True}), transcript_handler, vad_state, session_state, summary_store
+        _append_trace(vad_state, {"src": "stream", "chunk_empty": True})
+        yield gr.update(), _status("Listening..."), gr.update(), transcript_handler, vad_state, session_state, summary_store
         return
 
     rms = float(compute_rms(data))
@@ -379,7 +391,8 @@ async def stream_audio_chunk(
     if not should_send:
         status = _status("Speaking detected..." if vad_state.is_speaking else "Listening...")
         diag = {"src": "stream", "rms": round(rms, 5)}
-        yield gr.update(), status, _append_trace(vad_state, diag), transcript_handler, vad_state, session_state, summary_store
+        _append_trace(vad_state, diag)
+        yield gr.update(), status, gr.update(), transcript_handler, vad_state, session_state, summary_store
         return
 
     audio_array = get_buffer_array(vad_state)
@@ -394,10 +407,11 @@ async def stream_audio_chunk(
     vad_state.pending_task._started_at = time.monotonic()
     logger.info("VAD triggered — launched API task (%d PCM bytes)", len(pcm_bytes))
 
+    _append_trace(vad_state, {"src": "stream", "should_send": True, "pcm_bytes": len(pcm_bytes)})
     yield (
         gr.update(),           # chatbot — updated by poll when response arrives
         _status("Thinking..."),
-        _append_trace(vad_state, {"src": "stream", "should_send": True, "pcm_bytes": len(pcm_bytes)}),
+        gr.update(),           # debug_panel — poll updates it every 0.25s
         transcript_handler,
         vad_state,
         session_state,
