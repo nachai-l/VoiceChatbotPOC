@@ -132,7 +132,7 @@ def _consume_finished_task(
             NO_AUDIO,
             transcript_handler.get_history(),
             _status("Listening..."),
-            _append_trace(vad_state),
+            _append_trace(vad_state, {"src": "poll"}),
             transcript_handler,
             vad_state,
             session_state,
@@ -160,7 +160,7 @@ def _consume_finished_task(
             NO_AUDIO,
             transcript_handler.get_history(),
             _status("Error", error=True),
-            _append_trace(vad_state, {"error": str(exc)}),
+            _append_trace(vad_state, {"src": "poll", "error": str(exc)}),
             transcript_handler,
             vad_state,
             session_state,
@@ -250,7 +250,7 @@ def _consume_finished_task(
         audio_output,
         transcript_handler.get_history(),
         status,
-        _append_trace(vad_state, debug),
+        _append_trace(vad_state, {"src": "poll", **debug}),
         transcript_handler,
         vad_state,
         session_state,
@@ -276,6 +276,11 @@ async def stream_audio_chunk(
     """
     history = transcript_handler.get_history()
 
+    # Heartbeat: stamp last_stream_at on every call so poll can detect a dead stream.
+    # This mutation is on the shared vad_state object and persists even when we
+    # return gr.update() for the vad_state gr.State output.
+    vad_state.last_stream_at = time.monotonic()
+
     # Stale-copy guard: if this vad_state copy still holds a task that was
     # already consumed by the poll handler, clear the stale reference here so
     # stream_audio_chunk doesn't write it back to Gradio State.
@@ -300,9 +305,9 @@ async def stream_audio_chunk(
         # postprocess_data creates a new component instance with render=False,
         # which terminates the mic streaming connection → system stops after 1 input.
         yield (
-            history,                                        # chatbot — actual value
+            history,                                                                  # chatbot — actual value
             _status("Thinking..."),
-            _append_trace(vad_state, {"waiting": True}),   # debug_panel — trace log
+            _append_trace(vad_state, {"src": "stream", "waiting": True}),            # debug_panel — trace log
             gr.update(),           # transcript_state ← poll owns this
             gr.update(),           # vad_state  ← poll owns this while task runs
             gr.update(),           # session_state
@@ -315,7 +320,7 @@ async def stream_audio_chunk(
         yield (
             history,
             _status("Playing response..."),
-            _append_trace(vad_state),
+            _append_trace(vad_state, {"src": "stream"}),
             transcript_handler,
             vad_state,
             session_state,
@@ -324,12 +329,12 @@ async def stream_audio_chunk(
         return
 
     if chunk is None:
-        yield history, _status("Listening..."), _append_trace(vad_state), transcript_handler, vad_state, session_state, summary_store
+        yield history, _status("Listening..."), _append_trace(vad_state, {"src": "stream", "chunk_none": True}), transcript_handler, vad_state, session_state, summary_store
         return
 
     sample_rate, data = chunk
     if data is None or len(data) == 0:
-        yield history, _status("Listening..."), _append_trace(vad_state), transcript_handler, vad_state, session_state, summary_store
+        yield history, _status("Listening..."), _append_trace(vad_state, {"src": "stream", "chunk_empty": True}), transcript_handler, vad_state, session_state, summary_store
         return
 
     rms = float(compute_rms(data))
@@ -337,7 +342,7 @@ async def stream_audio_chunk(
 
     if not should_send:
         status = _status("Speaking detected..." if vad_state.is_speaking else "Listening...")
-        diag = {"rms": round(rms, 5)}
+        diag = {"src": "stream", "rms": round(rms, 5)}
         yield history, status, _append_trace(vad_state, diag), transcript_handler, vad_state, session_state, summary_store
         return
 
@@ -355,7 +360,7 @@ async def stream_audio_chunk(
     yield (
         history,
         _status("Thinking..."),
-        _append_trace(vad_state, {"should_send": True, "pcm_bytes": len(pcm_bytes)}),
+        _append_trace(vad_state, {"src": "stream", "should_send": True, "pcm_bytes": len(pcm_bytes)}),
         transcript_handler,
         vad_state,
         session_state,
@@ -376,13 +381,22 @@ async def poll_pending_result(
     if vad_state.pending_task is not None and _is_task_consumed(vad_state.pending_task):
         vad_state.pending_task = None
 
+    now = time.monotonic()
+    # Detect a dead mic stream: last_stream_at hasn't advanced in >2s even
+    # though we're past cooldown and not thinking.  Show a warning so the user
+    # knows to click the microphone button to restart.
+    _stream_dead = (
+        vad_state.last_stream_at > 0
+        and (now - vad_state.last_stream_at) > 2.0
+    )
+
     if vad_state.pending_task is None:
-        if time.monotonic() < vad_state.ignore_until:
+        if now < vad_state.ignore_until:
             return (
                 NO_AUDIO,
                 transcript_handler.get_history(),
                 _status("Playing response..."),
-                _append_trace(vad_state),
+                _append_trace(vad_state, {"src": "poll"}),
                 transcript_handler,
                 vad_state,
                 session_state,
@@ -392,11 +406,15 @@ async def poll_pending_result(
         # never gets stuck.  (The is_speaking check was removed: if ambient
         # noise set is_speaking=True during playback the poller would return
         # gr.update() indefinitely, freezing the UI on "Playing response...".)
+        if _stream_dead:
+            listening_status = _status("Mic stream stopped — click 🎤 to restart", error=True)
+        else:
+            listening_status = _status("Listening...")
         return (
             NO_AUDIO,
             transcript_handler.get_history(),
-            _status("Listening..."),
-            _append_trace(vad_state),
+            listening_status,
+            _append_trace(vad_state, {"src": "poll"}),
             transcript_handler,
             vad_state,
             session_state,
@@ -408,7 +426,7 @@ async def poll_pending_result(
             NO_AUDIO,
             transcript_handler.get_history(),
             _status("Thinking..."),
-            _append_trace(vad_state, {"waiting": True}),
+            _append_trace(vad_state, {"src": "poll", "waiting": True}),
             transcript_handler,
             vad_state,
             session_state,
@@ -529,6 +547,7 @@ def _live_trace(vad_state: VADState, extra: dict | None = None) -> dict:
     else:
         mode = "listening"
 
+    stream_age = round(now - vad_state.last_stream_at, 2) if vad_state.last_stream_at > 0 else None
     trace = {
         "mode": mode,
         "cooldown_remaining_s": remaining,
@@ -538,6 +557,7 @@ def _live_trace(vad_state: VADState, extra: dict | None = None) -> dict:
         "speech_chunks": vad_state.speech_chunks,
         "silence_chunks": vad_state.silence_chunks,
         "now_monotonic": round(now % 1000, 3),  # last 3 digits for readability
+        "stream_age_s": stream_age,  # seconds since last stream chunk; None = never received
     }
     if extra:
         trace.update(extra)
