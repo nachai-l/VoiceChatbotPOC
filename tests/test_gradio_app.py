@@ -183,11 +183,13 @@ class TestStreamAudioChunkIsAsyncGenerator:
         # Status is a real string so the UI updates
         assert "Thinking" in status
 
-        # ALL State outputs must be gr.update() no-ops so they never overwrite
-        # the poll handler's pending_task=None / ignore_until update.
         def _is_gr_update(v):
             return isinstance(v, dict) and v.get("__type__") == "update"
 
+        # chatbot must be gr.update() to avoid DOM flicker (no new messages while thinking)
+        assert _is_gr_update(chatbot),     "chatbot must be gr.update() in Thinking path"
+        # ALL State outputs must be gr.update() no-ops so they never overwrite
+        # the poll handler's pending_task=None / ignore_until update.
         assert _is_gr_update(vad_out),     "vad_state must be gr.update() in Thinking path"
         assert _is_gr_update(transcript),  "transcript_state must be gr.update() in Thinking path"
         assert _is_gr_update(session_out), "session_state must be gr.update() in Thinking path"
@@ -321,9 +323,12 @@ class TestStreamAudioChunkVADIntegration:
 class TestPollPendingResult:
     @pytest.mark.anyio
     async def test_no_task_returns_listening_status(self, handler, vad, session, summary):
-        audio_out, history, status, debug, _, _, _, _ = await poll_pending_result(handler, vad, session, summary)
+        audio_out, chatbot, status, debug, _, _, _, _ = await poll_pending_result(handler, vad, session, summary)
         assert audio_out is not None
-        assert history == []
+        # Poll returns gr.update() (no-op) for chatbot when no turn has completed —
+        # pushing the same history every 0.25 s causes visible DOM flicker.
+        assert isinstance(chatbot, dict) and chatbot.get("__type__") == "update", \
+            "poll must return gr.update() for chatbot when no new messages"
         # When truly idle (no task, no cooldown, not speaking) the poller must
         # explicitly return "Listening..." to prevent the stuck-state bug.
         assert "Listening" in status

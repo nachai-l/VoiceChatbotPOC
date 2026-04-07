@@ -178,7 +178,7 @@ def _consume_finished_task(
     if vad_state.pending_task is None:
         return (
             NO_AUDIO,
-            transcript_handler.get_history(),
+            gr.update(),           # chatbot — no new messages
             _status("Listening..."),
             _append_trace(vad_state, {"src": "poll"}),
             transcript_handler,
@@ -321,12 +321,13 @@ async def stream_audio_chunk(
 
     Does NOT output to audio_output — audio playback is owned exclusively
     by poll_pending_result to prevent rapid re-renders that kill the player.
-    """
-    history = transcript_handler.get_history()
 
+    Returns gr.update() for chatbot in all paths: transcript history only
+    changes when a turn completes (_consume_finished_task), so there is no
+    need for stream_audio_chunk to push chatbot updates every 0.25 s.
+    Constant chatbot writes caused visible DOM flicker (8 re-renders/second).
+    """
     # Heartbeat: stamp last_stream_at on every call so poll can detect a dead stream.
-    # This mutation is on the shared vad_state object and persists even when we
-    # return gr.update() for the vad_state gr.State output.
     vad_state.last_stream_at = time.monotonic()
 
     # Stale-copy guard: if this vad_state copy still holds a task that was
@@ -336,26 +337,13 @@ async def stream_audio_chunk(
         vad_state.pending_task = None
 
     if vad_state.pending_task is not None:
-        # CRITICAL: return actual values for non-State UI outputs (chatbot,
-        # status, debug_panel) but gr.update() (no-op) for all gr.State outputs.
-        #
-        # Race condition: stream_audio_chunk fires every 0.25 s and, if it
-        # returns the actual vad_state here, it can OVERWRITE the State that
-        # poll_pending_result just wrote (pending_task=None, ignore_until=now+5).
-        # That reset causes _consume_finished_task to re-run on every tick,
-        # keeping ignore_until perpetually in the future → stuck "Playing response...".
-        #
-        # gr.update() tells Gradio "keep the stored value unchanged", so the
-        # poll handler's write always survives regardless of call ordering.
-        #
-        # IMPORTANT: chatbot must NOT be gr.update() here.  When gr.update() is
-        # returned for a non-State component like gr.Chatbot, Gradio's
-        # postprocess_data creates a new component instance with render=False,
-        # which terminates the mic streaming connection → system stops after 1 input.
+        # CRITICAL: return gr.update() for all gr.State outputs so that
+        # poll_pending_result's State write (pending_task=None, ignore_until set)
+        # is never overwritten by this handler's stale vad_state copy.
         yield (
-            history,                                                                  # chatbot — actual value
+            gr.update(),           # chatbot — no change while thinking
             _status("Thinking..."),
-            _append_trace(vad_state, {"src": "stream", "waiting": True}),            # debug_panel — trace log
+            _append_trace(vad_state, {"src": "stream", "waiting": True}),
             gr.update(),           # transcript_state ← poll owns this
             gr.update(),           # vad_state  ← poll owns this while task runs
             gr.update(),           # session_state
@@ -366,7 +354,7 @@ async def stream_audio_chunk(
     now = time.monotonic()
     if now < vad_state.ignore_until:
         yield (
-            history,
+            gr.update(),           # chatbot — no change during playback
             _status("Playing response..."),
             _append_trace(vad_state, {"src": "stream"}),
             transcript_handler,
@@ -377,12 +365,12 @@ async def stream_audio_chunk(
         return
 
     if chunk is None:
-        yield history, _status("Listening..."), _append_trace(vad_state, {"src": "stream", "chunk_none": True}), transcript_handler, vad_state, session_state, summary_store
+        yield gr.update(), _status("Listening..."), _append_trace(vad_state, {"src": "stream", "chunk_none": True}), transcript_handler, vad_state, session_state, summary_store
         return
 
     sample_rate, data = chunk
     if data is None or len(data) == 0:
-        yield history, _status("Listening..."), _append_trace(vad_state, {"src": "stream", "chunk_empty": True}), transcript_handler, vad_state, session_state, summary_store
+        yield gr.update(), _status("Listening..."), _append_trace(vad_state, {"src": "stream", "chunk_empty": True}), transcript_handler, vad_state, session_state, summary_store
         return
 
     rms = float(compute_rms(data))
@@ -391,7 +379,7 @@ async def stream_audio_chunk(
     if not should_send:
         status = _status("Speaking detected..." if vad_state.is_speaking else "Listening...")
         diag = {"src": "stream", "rms": round(rms, 5)}
-        yield history, status, _append_trace(vad_state, diag), transcript_handler, vad_state, session_state, summary_store
+        yield gr.update(), status, _append_trace(vad_state, diag), transcript_handler, vad_state, session_state, summary_store
         return
 
     audio_array = get_buffer_array(vad_state)
@@ -407,7 +395,7 @@ async def stream_audio_chunk(
     logger.info("VAD triggered — launched API task (%d PCM bytes)", len(pcm_bytes))
 
     yield (
-        history,
+        gr.update(),           # chatbot — updated by poll when response arrives
         _status("Thinking..."),
         _append_trace(vad_state, {"src": "stream", "should_send": True, "pcm_bytes": len(pcm_bytes)}),
         transcript_handler,
@@ -439,11 +427,16 @@ async def poll_pending_result(
         and (now - vad_state.last_stream_at) > 2.0
     )
 
+    # Poll returns gr.update() (no-op) for chatbot in all non-consume paths.
+    # Chatbot history only changes when a turn completes (_consume_finished_task).
+    # Pushing the same history on every 0.25s tick causes visible DOM flicker.
+    CHATBOT_NO_CHANGE = gr.update()
+
     if vad_state.pending_task is None:
         if now < vad_state.ignore_until:
             return (
                 NO_AUDIO,
-                transcript_handler.get_history(),
+                CHATBOT_NO_CHANGE,
                 _status("Playing response..."),
                 _append_trace(vad_state, {"src": "poll"}),
                 transcript_handler,
@@ -461,7 +454,7 @@ async def poll_pending_result(
             listening_status = _status("Listening...")
         return (
             NO_AUDIO,
-            transcript_handler.get_history(),
+            CHATBOT_NO_CHANGE,
             listening_status,
             _append_trace(vad_state, {"src": "poll"}),
             transcript_handler,
@@ -480,7 +473,7 @@ async def poll_pending_result(
             vad_state.pending_task = None
             return (
                 NO_AUDIO,
-                transcript_handler.get_history(),
+                CHATBOT_NO_CHANGE,
                 _status("Request timed out — please try again", error=True),
                 _append_trace(vad_state, {"src": "poll", "timeout": True, "task_age_s": round(task_age, 1)}),
                 transcript_handler,
@@ -490,7 +483,7 @@ async def poll_pending_result(
             )
         return (
             NO_AUDIO,
-            transcript_handler.get_history(),
+            CHATBOT_NO_CHANGE,
             _status("Thinking..."),
             _append_trace(vad_state, {"src": "poll", "waiting": True}),
             transcript_handler,
