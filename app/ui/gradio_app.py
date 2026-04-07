@@ -24,12 +24,16 @@ from app.live.vad import VADState, process_chunk, get_buffer_array, reset_vad, c
 from app.orchestration.flash_lite_orchestrator import orchestrate
 from app.state.session_store import SessionState
 from app.state.summary_store import SummaryStore
+from app.tools.tool_executor import tool_executor
 
 logger = logging.getLogger(__name__)
 
 PLAYBACK_GAIN = 2.5
 DEFAULT_OUTPUT_SAMPLE_RATE = 24000
 PLAYBACK_COOLDOWN_SECONDS = 0.75
+# Cap total cooldown so status never appears permanently stuck even for very
+# long responses (audio_bytes > ~264 kB / ~5.5 s of audio at 24 kHz PCM16).
+MAX_PLAYBACK_COOLDOWN_SECONDS = 6.0
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +88,7 @@ def _make_orchestrate_fn(session_state: SessionState, summary_store: SummaryStor
     Mutations made inside orchestrate() are immediately visible to the caller.
     """
     async def _orchestrate_fn(utterance: str):
-        return await orchestrate(utterance, session_state, summary_store)
+        return await orchestrate(utterance, session_state, summary_store, tool_executor=tool_executor)
     return _orchestrate_fn
 
 
@@ -159,10 +163,11 @@ def _consume_finished_task(
     audio_output = _build_audio_output(result.audio_bytes)
 
     # Duration-based cooldown: covers actual playback + trailing buffer.
-    # Cap at 5 s so a long response never blocks the mic indefinitely.
+    # Capped at MAX_PLAYBACK_COOLDOWN_SECONDS so the status never appears
+    # permanently stuck for very long (verbose Phase-2) responses.
     if result.audio_bytes:
         audio_duration_s = len(result.audio_bytes) / (DEFAULT_OUTPUT_SAMPLE_RATE * 2)
-        cooldown = min(audio_duration_s, 5.0) + PLAYBACK_COOLDOWN_SECONDS
+        cooldown = min(audio_duration_s + PLAYBACK_COOLDOWN_SECONDS, MAX_PLAYBACK_COOLDOWN_SECONDS)
         vad_state.ignore_until = time.monotonic() + cooldown
 
     # Build debug trace for the panel
