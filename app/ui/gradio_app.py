@@ -33,7 +33,7 @@ DEFAULT_OUTPUT_SAMPLE_RATE = 24000
 PLAYBACK_COOLDOWN_SECONDS = 0.75
 # Cap total cooldown so status never appears permanently stuck even for very
 # long responses (audio_bytes > ~264 kB / ~5.5 s of audio at 24 kHz PCM16).
-MAX_PLAYBACK_COOLDOWN_SECONDS = 6.0
+MAX_PLAYBACK_COOLDOWN_SECONDS = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +96,22 @@ def _make_orchestrate_fn(session_state: SessionState, summary_store: SummaryStor
 # Shared result handling
 # ---------------------------------------------------------------------------
 
+def _is_task_consumed(task) -> bool:
+    """Return True if this task has already been consumed by _consume_finished_task.
+
+    Because Gradio may deepcopy VADState between handler invocations, two
+    concurrent handlers can hold references to the same asyncio.Task object
+    inside *different* copies of vad_state.  The poll handler clears
+    vad_state.pending_task on its copy, but the stream handler's copy still
+    holds the old reference and may write it back to Gradio State, making the
+    poll handler re-consume the finished task on every tick.
+
+    Marking the flag directly on the shared Task object (not on vad_state)
+    makes the consumed state visible to all copies simultaneously.
+    """
+    return getattr(task, "_voice_consumed", False)
+
+
 def _consume_finished_task(
     transcript_handler: TranscriptHandler,
     vad_state: VADState,
@@ -104,6 +120,10 @@ def _consume_finished_task(
 ):
     """Collect a finished background task and build UI outputs."""
     NO_AUDIO = gr.update()
+
+    # Stale-copy guard: task object already processed by a previous handler run.
+    if vad_state.pending_task is not None and _is_task_consumed(vad_state.pending_task):
+        vad_state.pending_task = None
 
     if vad_state.pending_task is None:
         return (
@@ -116,6 +136,10 @@ def _consume_finished_task(
             session_state,
             summary_store,
         )
+
+    # Mark as consumed on the Task object BEFORE reading result, so that any
+    # stale vad_state copy still pointing to this task will skip it.
+    vad_state.pending_task._voice_consumed = True
 
     try:
         result = vad_state.pending_task.result()
@@ -227,6 +251,12 @@ async def stream_audio_chunk(
     """
     history = transcript_handler.get_history()
 
+    # Stale-copy guard: if this vad_state copy still holds a task that was
+    # already consumed by the poll handler, clear the stale reference here so
+    # stream_audio_chunk doesn't write it back to Gradio State.
+    if vad_state.pending_task is not None and _is_task_consumed(vad_state.pending_task):
+        vad_state.pending_task = None
+
     if vad_state.pending_task is not None:
         yield history, _status("Thinking..."), {"waiting": True}, transcript_handler, vad_state, session_state, summary_store
         return
@@ -296,6 +326,10 @@ async def poll_pending_result(
 ):
     """Timer-driven poller for completed Live API tasks."""
     NO_AUDIO = gr.update()
+
+    # Stale-copy guard: task already consumed, clear the reference.
+    if vad_state.pending_task is not None and _is_task_consumed(vad_state.pending_task):
+        vad_state.pending_task = None
 
     if vad_state.pending_task is None:
         if time.monotonic() < vad_state.ignore_until:
