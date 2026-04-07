@@ -34,6 +34,8 @@ PLAYBACK_COOLDOWN_SECONDS = 0.75
 # Cap total cooldown so status never appears permanently stuck even for very
 # long responses (audio_bytes > ~264 kB / ~5.5 s of audio at 24 kHz PCM16).
 MAX_PLAYBACK_COOLDOWN_SECONDS = 5.0
+# Maximum number of trace entries retained in the sliding-window history.
+TRACE_LOG_MAX = 20
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +132,7 @@ def _consume_finished_task(
             NO_AUDIO,
             transcript_handler.get_history(),
             _status("Listening..."),
-            {},
+            _append_trace(vad_state),
             transcript_handler,
             vad_state,
             session_state,
@@ -158,7 +160,7 @@ def _consume_finished_task(
             NO_AUDIO,
             transcript_handler.get_history(),
             _status("Error", error=True),
-            {"error": str(exc)},
+            _append_trace(vad_state, {"error": str(exc)}),
             transcript_handler,
             vad_state,
             session_state,
@@ -248,7 +250,7 @@ def _consume_finished_task(
         audio_output,
         transcript_handler.get_history(),
         status,
-        debug,
+        _append_trace(vad_state, debug),
         transcript_handler,
         vad_state,
         session_state,
@@ -281,7 +283,8 @@ async def stream_audio_chunk(
         vad_state.pending_task = None
 
     if vad_state.pending_task is not None:
-        # CRITICAL: return gr.update() (no-op) for every gr.State output.
+        # CRITICAL: return actual values for non-State UI outputs (chatbot,
+        # status, debug_panel) but gr.update() (no-op) for all gr.State outputs.
         #
         # Race condition: stream_audio_chunk fires every 0.25 s and, if it
         # returns the actual vad_state here, it can OVERWRITE the State that
@@ -291,11 +294,16 @@ async def stream_audio_chunk(
         #
         # gr.update() tells Gradio "keep the stored value unchanged", so the
         # poll handler's write always survives regardless of call ordering.
+        #
+        # IMPORTANT: chatbot must NOT be gr.update() here.  When gr.update() is
+        # returned for a non-State component like gr.Chatbot, Gradio's
+        # postprocess_data creates a new component instance with render=False,
+        # which terminates the mic streaming connection → system stops after 1 input.
         yield (
-            gr.update(),           # chatbot
+            history,                                        # chatbot — actual value
             _status("Thinking..."),
-            {"waiting": True},
-            gr.update(),           # transcript_state
+            _append_trace(vad_state, {"waiting": True}),   # debug_panel — trace log
+            gr.update(),           # transcript_state ← poll owns this
             gr.update(),           # vad_state  ← poll owns this while task runs
             gr.update(),           # session_state
             gr.update(),           # summary_state
@@ -307,7 +315,7 @@ async def stream_audio_chunk(
         yield (
             history,
             _status("Playing response..."),
-            _live_trace(vad_state),
+            _append_trace(vad_state),
             transcript_handler,
             vad_state,
             session_state,
@@ -316,12 +324,12 @@ async def stream_audio_chunk(
         return
 
     if chunk is None:
-        yield history, _status("Listening..."), {}, transcript_handler, vad_state, session_state, summary_store
+        yield history, _status("Listening..."), _append_trace(vad_state), transcript_handler, vad_state, session_state, summary_store
         return
 
     sample_rate, data = chunk
     if data is None or len(data) == 0:
-        yield history, _status("Listening..."), {}, transcript_handler, vad_state, session_state, summary_store
+        yield history, _status("Listening..."), _append_trace(vad_state), transcript_handler, vad_state, session_state, summary_store
         return
 
     rms = float(compute_rms(data))
@@ -329,12 +337,8 @@ async def stream_audio_chunk(
 
     if not should_send:
         status = _status("Speaking detected..." if vad_state.is_speaking else "Listening...")
-        diag = {
-            "rms": round(rms, 5),
-            "speech": vad_state.speech_chunks,
-            "silence": vad_state.silence_chunks,
-        }
-        yield history, status, diag, transcript_handler, vad_state, session_state, summary_store
+        diag = {"rms": round(rms, 5)}
+        yield history, status, _append_trace(vad_state, diag), transcript_handler, vad_state, session_state, summary_store
         return
 
     audio_array = get_buffer_array(vad_state)
@@ -351,7 +355,7 @@ async def stream_audio_chunk(
     yield (
         history,
         _status("Thinking..."),
-        {"should_send": True, "pcm_bytes": len(pcm_bytes)},
+        _append_trace(vad_state, {"should_send": True, "pcm_bytes": len(pcm_bytes)}),
         transcript_handler,
         vad_state,
         session_state,
@@ -378,7 +382,7 @@ async def poll_pending_result(
                 NO_AUDIO,
                 transcript_handler.get_history(),
                 _status("Playing response..."),
-                _live_trace(vad_state),
+                _append_trace(vad_state),
                 transcript_handler,
                 vad_state,
                 session_state,
@@ -392,7 +396,7 @@ async def poll_pending_result(
             NO_AUDIO,
             transcript_handler.get_history(),
             _status("Listening..."),
-            _live_trace(vad_state),
+            _append_trace(vad_state),
             transcript_handler,
             vad_state,
             session_state,
@@ -404,7 +408,7 @@ async def poll_pending_result(
             NO_AUDIO,
             transcript_handler.get_history(),
             _status("Thinking..."),
-            _live_trace(vad_state, {"waiting": True}),
+            _append_trace(vad_state, {"waiting": True}),
             transcript_handler,
             vad_state,
             session_state,
@@ -477,13 +481,14 @@ def handle_clear(
     """Reset the session."""
     transcript_handler.clear()
     vad_state = reset_vad(vad_state)
+    vad_state.trace_log = []  # clear trace history on full session reset
     session_state.reset()
     summary_store.clear()
     return (
         [],
         None,
         _status("Session cleared — ready"),
-        {},
+        [],
         transcript_handler,
         vad_state,
         session_state,
@@ -539,6 +544,20 @@ def _live_trace(vad_state: VADState, extra: dict | None = None) -> dict:
     return trace
 
 
+def _append_trace(vad_state: VADState, extra: dict | None = None) -> list:
+    """Append the current trace snapshot to vad_state.trace_log and return the log.
+
+    The log is a sliding window capped at TRACE_LOG_MAX entries.  Returning the
+    list directly as the debug_panel value gives the user a scrollable history
+    of the last N ticks instead of only the most-recent snapshot.
+    """
+    entry = _live_trace(vad_state, extra)
+    vad_state.trace_log.append(entry)
+    if len(vad_state.trace_log) > TRACE_LOG_MAX:
+        del vad_state.trace_log[:-TRACE_LOG_MAX]
+    return vad_state.trace_log
+
+
 # ---------------------------------------------------------------------------
 # Layout
 # ---------------------------------------------------------------------------
@@ -572,12 +591,12 @@ def create_app() -> gr.Blocks:
             with gr.Column(scale=1):
                 status_md = gr.Markdown(_status("Listening..."))
                 gr.Markdown(
-                    "**Live Trace** — updates every 250 ms. "
+                    "**Live Trace** — sliding window of last 20 ticks. "
                     "`mode`: listening / speaking / thinking / playing. "
                     "`cooldown_remaining_s`: seconds until mic re-opens. "
                     "`task_status`: none / running / done_pending_consume / consumed."
                 )
-                debug_panel = gr.JSON(label="Trace", value={})
+                debug_panel = gr.JSON(label="Trace (newest last)", value=[])
                 clear_btn = gr.Button("Clear session", variant="secondary")
 
         transcript_state = gr.State(_new_transcript_handler())
