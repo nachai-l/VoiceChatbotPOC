@@ -309,21 +309,20 @@ async def poll_pending_result(
                 session_state,
                 summary_store,
             )
-        # Explicitly return "Listening..." when truly idle so the status never
-        # gets stuck on "Playing response..." if the browser paused the mic stream.
-        # When VAD is accumulating speech the stream handler owns the status.
-        if not vad_state.is_speaking:
-            return (
-                NO_AUDIO,
-                transcript_handler.get_history(),
-                _status("Listening..."),
-                {},
-                transcript_handler,
-                vad_state,
-                session_state,
-                summary_store,
-            )
-        return NO_AUDIO, transcript_handler.get_history(), gr.update(), gr.update(), transcript_handler, vad_state, session_state, summary_store
+        # Cooldown has expired — always return "Listening..." so the status
+        # never gets stuck.  (The is_speaking check was removed: if ambient
+        # noise set is_speaking=True during playback the poller would return
+        # gr.update() indefinitely, freezing the UI on "Playing response...".)
+        return (
+            NO_AUDIO,
+            transcript_handler.get_history(),
+            _status("Listening..."),
+            {},
+            transcript_handler,
+            vad_state,
+            session_state,
+            summary_store,
+        )
 
     if not vad_state.pending_task.done():
         return (

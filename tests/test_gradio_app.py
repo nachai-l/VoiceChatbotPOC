@@ -624,15 +624,21 @@ class TestPollIdleTransition:
         assert debug == {}
 
     @pytest.mark.anyio
-    async def test_does_not_override_speaking_status(self, handler, session, summary):
-        """When VAD is accumulating speech, the poller must not override 'Speaking...' with 'Listening...'."""
+    async def test_returns_listening_even_when_is_speaking_true(self, handler, session, summary):
+        """Regression: old code returned gr.update() when is_speaking=True after cooldown
+        expired, causing the UI to freeze permanently on 'Playing response...'.
+        The poller must always return 'Listening...' once the cooldown is done,
+        regardless of VAD speech state — the stream handler will override it on
+        the next 0.25s tick if the user is actually speaking."""
         vad = _new_vad_state()
         vad.is_speaking = True
+        vad.ignore_until = time.monotonic() - 1.0  # cooldown already expired
 
         _, _, status, _, _, _, _, _ = await poll_pending_result(handler, vad, session, summary)
-        assert not isinstance(status, str), (
-            "poller must return gr.update() when stream is in speech mode"
+        assert isinstance(status, str), (
+            "poller must return 'Listening...' string, not gr.update(), when cooldown has expired"
         )
+        assert "Listening" in status
 
 
 # ---------------------------------------------------------------------------
@@ -685,6 +691,31 @@ class TestDurationBasedCooldown:
 
         assert cooldown_applied >= duration_s
         assert cooldown_applied >= duration_s + PLAYBACK_COOLDOWN_SECONDS - 0.05
+
+    @pytest.mark.anyio
+    async def test_cooldown_capped_at_five_seconds(self, handler, session, summary):
+        """Regression: very long audio must not block the mic indefinitely.
+        Cooldown must be capped at 5 s + PLAYBACK_COOLDOWN_SECONDS."""
+        from app.live.live_session_manager import LiveSessionResult
+        from app.ui.gradio_app import DEFAULT_OUTPUT_SAMPLE_RATE
+
+        sr = DEFAULT_OUTPUT_SAMPLE_RATE
+        bps = 2
+        # 30 seconds of audio — without the cap this would lock the mic for 30s
+        pcm = bytes(sr * bps * 30)
+
+        vad = _new_vad_state()
+        fut = asyncio.get_event_loop().create_future()
+        fut.set_result(LiveSessionResult(pcm, "hi", "hello"))
+        vad.pending_task = fut
+
+        t0 = time.monotonic()
+        _, _, _, _, _, returned_vad, _, _ = _consume_finished_task(handler, vad, session, summary)
+        cooldown_applied = returned_vad.ignore_until - t0
+
+        assert cooldown_applied <= 5.0 + PLAYBACK_COOLDOWN_SECONDS + 0.05, (
+            "cooldown must be capped at 5 s to avoid permanently blocking the mic"
+        )
 
     @pytest.mark.anyio
     async def test_empty_audio_no_cooldown_set(self, handler, session, summary):
