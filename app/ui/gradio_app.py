@@ -137,9 +137,16 @@ def _consume_finished_task(
             summary_store,
         )
 
+    # Capture the task reference BEFORE clearing pending_task.
+    # We need it for idempotent cooldown calculation later.
+    _task_ref = vad_state.pending_task
+
     # Mark as consumed on the Task object BEFORE reading result, so that any
     # stale vad_state copy still pointing to this task will skip it.
-    vad_state.pending_task._voice_consumed = True
+    _task_ref._voice_consumed = True
+    # Record completion time ONCE — makes ignore_until idempotent on re-entry.
+    if not hasattr(_task_ref, "_completed_at"):
+        _task_ref._completed_at = time.monotonic()
 
     try:
         result = vad_state.pending_task.result()
@@ -186,13 +193,29 @@ def _consume_finished_task(
 
     audio_output = _build_audio_output(result.audio_bytes)
 
-    # Duration-based cooldown: covers actual playback + trailing buffer.
-    # Capped at MAX_PLAYBACK_COOLDOWN_SECONDS so the status never appears
-    # permanently stuck for very long (verbose Phase-2) responses.
+    # Duration-based cooldown — IDEMPOTENT via task._completed_at.
+    #
+    # Using time.monotonic() directly here caused the stuck-status bug:
+    # if _consume_finished_task ran twice (due to any re-entry), each call
+    # pushed ignore_until further into the future, creating an infinite cooldown.
+    #
+    # Fix: record the completion timestamp ONCE on the task object the first
+    # time this function runs.  Subsequent calls read the same timestamp, so
+    # ignore_until is always set to the *same* absolute value regardless of
+    # how many times the function is invoked.  After MAX_PLAYBACK_COOLDOWN_SECONDS
+    # the value is in the past and the status correctly transitions to "Listening...".
     if result.audio_bytes:
         audio_duration_s = len(result.audio_bytes) / (DEFAULT_OUTPUT_SAMPLE_RATE * 2)
         cooldown = min(audio_duration_s + PLAYBACK_COOLDOWN_SECONDS, MAX_PLAYBACK_COOLDOWN_SECONDS)
-        vad_state.ignore_until = time.monotonic() + cooldown
+        # IDEMPOTENT: use _task_ref._completed_at (set once above) so that
+        # ignore_until is always the same absolute value even if this code
+        # runs multiple times for the same task.
+        vad_state.ignore_until = _task_ref._completed_at + cooldown
+        logger.info(
+            "_consume: completed_at=%.3f ignore_until=%.3f cooldown=%.2fs audio=%.2fs now=%.3f",
+            _task_ref._completed_at, vad_state.ignore_until, cooldown, audio_duration_s,
+            time.monotonic(),
+        )
 
     # Build debug trace for the panel
     decision = result.orchestration_decision
@@ -284,7 +307,7 @@ async def stream_audio_chunk(
         yield (
             history,
             _status("Playing response..."),
-            {"cooldown_s": round(vad_state.ignore_until - now, 2)},
+            _live_trace(vad_state),
             transcript_handler,
             vad_state,
             session_state,
@@ -355,7 +378,7 @@ async def poll_pending_result(
                 NO_AUDIO,
                 transcript_handler.get_history(),
                 _status("Playing response..."),
-                {"cooldown_s": round(vad_state.ignore_until - time.monotonic(), 2)},
+                _live_trace(vad_state),
                 transcript_handler,
                 vad_state,
                 session_state,
@@ -369,7 +392,7 @@ async def poll_pending_result(
             NO_AUDIO,
             transcript_handler.get_history(),
             _status("Listening..."),
-            {},
+            _live_trace(vad_state),
             transcript_handler,
             vad_state,
             session_state,
@@ -381,7 +404,7 @@ async def poll_pending_result(
             NO_AUDIO,
             transcript_handler.get_history(),
             _status("Thinking..."),
-            {"waiting": True},
+            _live_trace(vad_state, {"waiting": True}),
             transcript_handler,
             vad_state,
             session_state,
@@ -473,6 +496,49 @@ def _status(message: str, error: bool = False) -> str:
     return f"**Status:** {icon} {message}"
 
 
+def _live_trace(vad_state: VADState, extra: dict | None = None) -> dict:
+    """Return a diagnostic dict shown in the live-trace panel on every tick.
+
+    Rendered in the UI as a JSON block so the user can see exactly what the
+    server state is — useful for debugging stuck-status issues.
+    """
+    now = time.monotonic()
+    remaining = round(vad_state.ignore_until - now, 2) if vad_state.ignore_until > now else 0.0
+    task = vad_state.pending_task
+
+    if task is None:
+        task_status = "none"
+    elif getattr(task, "_voice_consumed", False):
+        task_status = "consumed"
+    elif task.done():
+        task_status = "done_pending_consume"
+    else:
+        task_status = "running"
+
+    if task is None and vad_state.ignore_until > now:
+        mode = "playing"
+    elif task is not None:
+        mode = "thinking"
+    elif vad_state.is_speaking:
+        mode = "speaking"
+    else:
+        mode = "listening"
+
+    trace = {
+        "mode": mode,
+        "cooldown_remaining_s": remaining,
+        "ignore_until_offset_s": round(vad_state.ignore_until - now, 3),
+        "task_status": task_status,
+        "is_speaking": vad_state.is_speaking,
+        "speech_chunks": vad_state.speech_chunks,
+        "silence_chunks": vad_state.silence_chunks,
+        "now_monotonic": round(now % 1000, 3),  # last 3 digits for readability
+    }
+    if extra:
+        trace.update(extra)
+    return trace
+
+
 # ---------------------------------------------------------------------------
 # Layout
 # ---------------------------------------------------------------------------
@@ -505,6 +571,12 @@ def create_app() -> gr.Blocks:
 
             with gr.Column(scale=1):
                 status_md = gr.Markdown(_status("Listening..."))
+                gr.Markdown(
+                    "**Live Trace** — updates every 250 ms. "
+                    "`mode`: listening / speaking / thinking / playing. "
+                    "`cooldown_remaining_s`: seconds until mic re-opens. "
+                    "`task_status`: none / running / done_pending_consume / consumed."
+                )
                 debug_panel = gr.JSON(label="Trace", value={})
                 clear_btn = gr.Button("Clear session", variant="secondary")
 

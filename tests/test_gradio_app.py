@@ -326,7 +326,7 @@ class TestPollPendingResult:
         # When truly idle (no task, no cooldown, not speaking) the poller must
         # explicitly return "Listening..." to prevent the stuck-state bug.
         assert "Listening" in status
-        assert debug == {}
+        assert debug.get("mode") == "listening"
 
 
 # ---------------------------------------------------------------------------
@@ -650,7 +650,7 @@ class TestPollPendingResultExpanded:
 
         audio_out, history, status, debug, _, _, _, _ = await poll_pending_result(handler, vad, session, summary)
         assert "Thinking" in status
-        assert debug.get("waiting") is True
+        assert debug.get("waiting") is True or debug.get("mode") == "thinking"
 
         vad.pending_task.cancel()
 
@@ -674,7 +674,7 @@ class TestPollPendingResultExpanded:
 
         audio_out, _, status, debug, _, _, _, _ = await poll_pending_result(handler, vad, session, summary)
         assert "Playing" in status
-        assert "cooldown_s" in debug
+        assert "cooldown_remaining_s" in debug
 
 
 # ---------------------------------------------------------------------------
@@ -702,7 +702,7 @@ class TestPollIdleTransition:
         _, _, status, debug, _, _, _, _ = await poll_pending_result(handler, vad, session, summary)
         assert isinstance(status, str)
         assert "Listening" in status
-        assert debug == {}
+        assert debug.get("mode") == "listening"
 
     @pytest.mark.anyio
     async def test_returns_listening_even_when_is_speaking_true(self, handler, session, summary):
@@ -870,7 +870,7 @@ class TestStreamAudioChunkCooldown:
         results = await _collect(stream_audio_chunk((sr, data), handler, vad, session, summary))
         _, status, debug, _, _, _, _ = results[0]
         assert "Playing" in status
-        assert "cooldown_s" in debug
+        assert "cooldown_remaining_s" in debug
 
     @pytest.mark.anyio
     async def test_resumes_listening_after_cooldown(self, handler, session, summary):
