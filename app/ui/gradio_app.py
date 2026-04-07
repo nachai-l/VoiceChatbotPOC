@@ -33,7 +33,7 @@ DEFAULT_OUTPUT_SAMPLE_RATE = 24000
 PLAYBACK_COOLDOWN_SECONDS = 0.75
 # Cap total cooldown so status never appears permanently stuck even for very
 # long responses (audio_bytes > ~264 kB / ~5.5 s of audio at 24 kHz PCM16).
-MAX_PLAYBACK_COOLDOWN_SECONDS = 6.0
+MAX_PLAYBACK_COOLDOWN_SECONDS = 5.0
 
 
 # ---------------------------------------------------------------------------
