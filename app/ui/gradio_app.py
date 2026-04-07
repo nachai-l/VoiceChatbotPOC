@@ -302,9 +302,15 @@ def _consume_finished_task(
     else:
         status = _status("Response received with warning", error=True)
 
+    history = transcript_handler.get_history()
+    logger.info(
+        "_consume: returning chatbot history with %d message(s): %s",
+        len(history),
+        [(m["role"], m["content"][:40]) for m in history],
+    )
     return (
         audio_output,
-        transcript_handler.get_history(),
+        history,
         status,
         _append_trace(vad_state, {"src": "poll", **debug}),
         transcript_handler,
@@ -363,14 +369,18 @@ async def stream_audio_chunk(
     now = time.monotonic()
     if now < vad_state.ignore_until:
         _append_trace(vad_state, {"src": "stream"})
+        # Return gr.update() for transcript_state and vad_state during playback:
+        # poll owns both for the duration of the cooldown window.  If stream
+        # writes back its (possibly stale) copy it can silently erase the
+        # transcript history that poll just committed.
         yield (
             gr.update(),           # chatbot — no change during playback
             _status("Playing response..."),
             gr.update(),           # debug_panel — poll updates it every 0.25s
-            transcript_handler,
-            vad_state,
-            session_state,
-            summary_store,
+            gr.update(),           # transcript_state ← poll owns this during cooldown
+            gr.update(),           # vad_state ← poll owns this during cooldown
+            gr.update(),           # session_state
+            gr.update(),           # summary_state
         )
         return
 
