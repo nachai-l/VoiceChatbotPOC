@@ -30,6 +30,7 @@ from app.ui.gradio_app import (
     _consume_finished_task,
     _new_vad_state,
     PLAYBACK_COOLDOWN_SECONDS,
+    MAX_PLAYBACK_COOLDOWN_SECONDS,
 )
 
 SR = 16000
@@ -697,6 +698,50 @@ class TestDurationBasedCooldown:
         before = time.monotonic()
         _, _, _, _, _, returned_vad, _, _ = _consume_finished_task(handler, vad, session, summary)
         assert returned_vad.ignore_until <= before + 0.01
+
+    @pytest.mark.anyio
+    async def test_cooldown_capped_for_very_long_audio(self, handler, session, summary):
+        """Regression (stuck 'Playing response...'): verbose Phase-2 responses with
+        audio_bytes≥264 kB (~5.5 s) must not create a cooldown longer than
+        MAX_PLAYBACK_COOLDOWN_SECONDS, preventing the UI from appearing permanently stuck."""
+        from app.live.live_session_manager import LiveSessionResult
+        from app.ui.gradio_app import MAX_PLAYBACK_COOLDOWN_SECONDS, DEFAULT_OUTPUT_SAMPLE_RATE
+
+        # Simulate a very long response: 12 seconds of audio
+        sr = DEFAULT_OUTPUT_SAMPLE_RATE
+        bps = 2
+        very_long_pcm = bytes(sr * bps * 12)  # 12 s → would give 12.75 s uncapped
+
+        vad = _new_vad_state()
+        fut = asyncio.get_event_loop().create_future()
+        fut.set_result(LiveSessionResult(very_long_pcm, "hi", "hello"))
+        vad.pending_task = fut
+
+        t0 = time.monotonic()
+        _, _, _, _, _, returned_vad, _, _ = _consume_finished_task(handler, vad, session, summary)
+        cooldown_applied = returned_vad.ignore_until - t0
+
+        # Must not exceed the cap
+        assert cooldown_applied <= MAX_PLAYBACK_COOLDOWN_SECONDS + 0.05
+
+    @pytest.mark.anyio
+    async def test_cooldown_screenshot_case(self, handler, session, summary):
+        """Exact case from the bug report: audio_bytes=240004 (≈5 s) must produce
+        a cooldown ≤ MAX_PLAYBACK_COOLDOWN_SECONDS even though naive arithmetic
+        would give 5.75 s which should be under the 6 s cap."""
+        from app.live.live_session_manager import LiveSessionResult
+        from app.ui.gradio_app import MAX_PLAYBACK_COOLDOWN_SECONDS
+
+        vad = _new_vad_state()
+        fut = asyncio.get_event_loop().create_future()
+        fut.set_result(LiveSessionResult(b"\x00\x01" * 120002, "hi", "hello"))
+        vad.pending_task = fut
+
+        t0 = time.monotonic()
+        _, _, _, _, _, returned_vad, _, _ = _consume_finished_task(handler, vad, session, summary)
+        cooldown_applied = returned_vad.ignore_until - t0
+
+        assert cooldown_applied <= MAX_PLAYBACK_COOLDOWN_SECONDS + 0.05
 
 
 # ---------------------------------------------------------------------------
