@@ -5,7 +5,8 @@ Covers:
   - handle_voice_turn: async generator contract + early exits (kept for regression)
   - stream_audio_chunk: VAD-driven streaming handler
   - poll_pending_result: timer-driven completion path
-  - _build_audio_output: numpy tuple creation and gain
+  - _build_audio_output: numpy tuple creation and gain (internal helper)
+  - _build_audio_html: HTML audio player generation
   - _consume_finished_task: background task result handling
   - handle_clear: session reset
   - create_app: Gradio 6.x API compatibility
@@ -416,12 +417,14 @@ class TestCreateApp:
         assert "gr.Timer(" in src
         assert ".tick(" in src
 
-    def test_audio_output_type_is_numpy(self):
-        """Regression: audio output must use type='numpy' to match tuple returns."""
+    def test_audio_output_uses_html_player(self):
+        """Audio output must use gr.HTML (not gr.Audio) to avoid the browser
+        AudioContext reset that kills the mic streaming connection on playback."""
         import inspect
         import app.ui.gradio_app as module
         src = inspect.getsource(module.create_app)
-        assert 'type="numpy"' in src
+        assert "gr.HTML(" in src, "audio_player must be gr.HTML to decouple from AudioContext"
+        assert "audio_player" in src
 
     def test_stream_handler_does_not_output_to_audio(self):
         """Regression: stream_audio_chunk must NOT write to audio_output.
@@ -497,8 +500,8 @@ class TestConsumeFinishedTask:
         vad.pending_task = future
 
         audio_out, history, status, debug, _, returned_vad, _, _ = _consume_finished_task(handler, vad, session, summary)
-        assert isinstance(audio_out, tuple)
-        assert len(audio_out) == 2
+        assert isinstance(audio_out, str), "audio output must be HTML string from gr.HTML player"
+        assert "<audio" in audio_out, "audio output must contain an <audio> element"
         assert returned_vad.pending_task is None
         assert debug[-1]["ok"] is True
         assert "Playing" in status
