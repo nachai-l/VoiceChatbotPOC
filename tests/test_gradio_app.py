@@ -541,6 +541,52 @@ class TestConsumeFinishedTask:
         assert debug.get("selected_tool") == "get_balance"
         assert debug.get("confidence") == pytest.approx(0.9, abs=0.001)
 
+    @pytest.mark.anyio
+    async def test_marks_task_as_consumed(self, handler, session, summary):
+        """Regression (Gradio State race): _consume_finished_task must mark the
+        asyncio Task as _voice_consumed=True so that stale vad_state copies
+        held by stream_audio_chunk don't re-process the same result."""
+        from app.live.live_session_manager import LiveSessionResult
+
+        vad = _new_vad_state()
+        future = asyncio.get_event_loop().create_future()
+        future.set_result(LiveSessionResult(b"\x00\x02" * 100, "hi", "hello"))
+        vad.pending_task = future
+
+        _consume_finished_task(handler, vad, session, summary)
+        assert getattr(future, "_voice_consumed", False) is True
+
+    @pytest.mark.anyio
+    async def test_second_call_with_same_stale_task_skips_re_consume(self, handler, session, summary):
+        """Regression (Gradio State race): if stream_audio_chunk writes stale
+        vad_state back to Gradio State, a second poll call on the same task
+        must not re-process the result (no duplicate transcripts, no cooldown reset)."""
+        from app.live.live_session_manager import LiveSessionResult
+
+        vad = _new_vad_state()
+        future = asyncio.get_event_loop().create_future()
+        future.set_result(LiveSessionResult(b"\x00\x02" * 100, "hi", "hello"))
+        vad.pending_task = future
+
+        # First consumption
+        _, _, _, _, _, vad1, _, summary1 = _consume_finished_task(handler, vad, session, summary)
+        assert vad1.pending_task is None
+        turn_count_after_first = summary1.turn_count()
+
+        # Simulate Gradio State race: stale copy of vad_state with same task
+        stale_vad = _new_vad_state()
+        stale_vad.pending_task = future  # same task object, already _voice_consumed
+
+        _, _, status2, _, _, vad2, _, summary2 = _consume_finished_task(
+            TranscriptHandler(), stale_vad, session, summary1
+        )
+        # Must clear the stale reference
+        assert vad2.pending_task is None
+        # Must NOT re-process the result (summary should not gain another turn)
+        assert summary2.turn_count() == turn_count_after_first
+        # Status must not be "Playing response..." (no re-consume means no cooldown reset)
+        assert "Listening" in status2
+
 
 # ---------------------------------------------------------------------------
 # _new_vad_state
@@ -800,3 +846,27 @@ class TestStreamAudioChunkCooldown:
         results = await _collect(stream_audio_chunk((sr, data), handler, vad, session, summary))
         _, status, _, _, _, _, _ = results[0]
         assert "Listening" in status
+
+    @pytest.mark.anyio
+    async def test_stream_clears_stale_consumed_task(self, handler, session, summary):
+        """Regression (Gradio State race): when stream_audio_chunk receives a
+        vad_state copy that still holds a _voice_consumed Task, it must clear
+        the stale reference so it doesn't write it back to Gradio State and
+        cause the poll handler to re-consume the result on the next tick."""
+        from app.live.live_session_manager import LiveSessionResult
+
+        # Simulate a task that was already consumed by the poll handler
+        future = asyncio.get_event_loop().create_future()
+        future.set_result(LiveSessionResult(b"\x00\x02" * 100, "hi", "hello"))
+        future._voice_consumed = True  # mark as consumed
+
+        vad = _new_vad_state()
+        vad.pending_task = future  # stale copy still has it
+
+        sr, data = _silence_chunk()
+        results = await _collect(stream_audio_chunk((sr, data), handler, vad, session, summary))
+        # stream_audio_chunk yields 7 values (no audio_output)
+        _, _, _, _, returned_vad, _, _ = results[0]
+
+        # The stale reference must be cleared — NOT written back
+        assert returned_vad.pending_task is None
