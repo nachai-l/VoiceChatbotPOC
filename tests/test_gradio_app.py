@@ -298,7 +298,7 @@ class TestStreamAudioChunkVADIntegration:
         results, _ = await _trigger_vad(handler, vad, session, summary, monkeypatch, mock_send_turn)
         _, _, status, debug, _, _, _, _ = results[-1]
         assert "warning" in status.lower()
-        assert "timeout" in debug.get("error", "")
+        assert "timeout" in debug[-1].get("error", "")
 
     @pytest.mark.anyio
     async def test_vad_resets_after_send(self, handler, vad, session, summary, monkeypatch):
@@ -326,7 +326,7 @@ class TestPollPendingResult:
         # When truly idle (no task, no cooldown, not speaking) the poller must
         # explicitly return "Listening..." to prevent the stuck-state bug.
         assert "Listening" in status
-        assert debug.get("mode") == "listening"
+        assert debug[-1].get("mode") == "listening"
 
 
 # ---------------------------------------------------------------------------
@@ -500,7 +500,7 @@ class TestConsumeFinishedTask:
         assert isinstance(audio_out, tuple)
         assert len(audio_out) == 2
         assert returned_vad.pending_task is None
-        assert debug["ok"] is True
+        assert debug[-1]["ok"] is True
         assert "Playing" in status
 
     @pytest.mark.anyio
@@ -514,7 +514,7 @@ class TestConsumeFinishedTask:
 
         audio_out, history, status, debug, _, returned_vad, _, _ = _consume_finished_task(handler, vad, session, summary)
         assert "warning" in status.lower() or "Error" in status
-        assert debug["error"] == "API timeout"
+        assert debug[-1]["error"] == "API timeout"
         assert returned_vad.pending_task is None
 
     @pytest.mark.anyio
@@ -572,9 +572,9 @@ class TestConsumeFinishedTask:
         vad.pending_task = future
 
         _, _, _, debug, _, _, _, _ = _consume_finished_task(handler, vad, session, summary)
-        assert debug.get("intent") == "balance_inquiry"
-        assert debug.get("selected_tool") == "get_balance"
-        assert debug.get("confidence") == pytest.approx(0.9, abs=0.001)
+        assert debug[-1].get("intent") == "balance_inquiry"
+        assert debug[-1].get("selected_tool") == "get_balance"
+        assert debug[-1].get("confidence") == pytest.approx(0.9, abs=0.001)
 
     @pytest.mark.anyio
     async def test_marks_task_as_consumed(self, handler, session, summary):
@@ -650,7 +650,7 @@ class TestPollPendingResultExpanded:
 
         audio_out, history, status, debug, _, _, _, _ = await poll_pending_result(handler, vad, session, summary)
         assert "Thinking" in status
-        assert debug.get("waiting") is True or debug.get("mode") == "thinking"
+        assert debug[-1].get("waiting") is True or debug[-1].get("mode") == "thinking"
 
         vad.pending_task.cancel()
 
@@ -665,7 +665,7 @@ class TestPollPendingResultExpanded:
 
         audio_out, history, status, debug, _, returned_vad, _, _ = await poll_pending_result(handler, vad, session, summary)
         assert returned_vad.pending_task is None
-        assert debug["ok"] is True
+        assert debug[-1]["ok"] is True
 
     @pytest.mark.anyio
     async def test_shows_cooldown_during_playback(self, handler, session, summary):
@@ -674,7 +674,7 @@ class TestPollPendingResultExpanded:
 
         audio_out, _, status, debug, _, _, _, _ = await poll_pending_result(handler, vad, session, summary)
         assert "Playing" in status
-        assert "cooldown_remaining_s" in debug
+        assert "cooldown_remaining_s" in debug[-1]
 
 
 # ---------------------------------------------------------------------------
@@ -702,7 +702,7 @@ class TestPollIdleTransition:
         _, _, status, debug, _, _, _, _ = await poll_pending_result(handler, vad, session, summary)
         assert isinstance(status, str)
         assert "Listening" in status
-        assert debug.get("mode") == "listening"
+        assert debug[-1].get("mode") == "listening"
 
     @pytest.mark.anyio
     async def test_returns_listening_even_when_is_speaking_true(self, handler, session, summary):
@@ -870,7 +870,7 @@ class TestStreamAudioChunkCooldown:
         results = await _collect(stream_audio_chunk((sr, data), handler, vad, session, summary))
         _, status, debug, _, _, _, _ = results[0]
         assert "Playing" in status
-        assert "cooldown_remaining_s" in debug
+        assert "cooldown_remaining_s" in debug[-1]
 
     @pytest.mark.anyio
     async def test_resumes_listening_after_cooldown(self, handler, session, summary):

@@ -36,6 +36,7 @@ class VADState:
     is_speaking: bool = False
     pending_task: object = None  # asyncio.Task for in-flight API call
     ignore_until: float = 0.0   # monotonic timestamp: ignore mic input until this time
+    trace_log: list = field(default_factory=list)  # sliding window of trace dicts
 
 
 def compute_rms(data: np.ndarray) -> float:
@@ -95,5 +96,7 @@ def get_buffer_array(state: VADState) -> np.ndarray | None:
 
 
 def reset_vad(state: VADState) -> VADState:
-    """Return a fresh VADState, preserving only the sample rate."""
-    return VADState(buffer_sr=state.buffer_sr)
+    """Return a fresh VADState, preserving sample rate and trace log across turns."""
+    new_state = VADState(buffer_sr=state.buffer_sr)
+    new_state.trace_log = state.trace_log  # preserve trace history across turns
+    return new_state
