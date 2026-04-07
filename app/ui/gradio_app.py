@@ -36,6 +36,9 @@ PLAYBACK_COOLDOWN_SECONDS = 0.75
 MAX_PLAYBACK_COOLDOWN_SECONDS = 5.0
 # Maximum number of trace entries retained in the sliding-window history.
 TRACE_LOG_MAX = 20
+# If the API task has not completed within this many seconds, auto-cancel it
+# and return the system to listening mode so the user can try again.
+TASK_TIMEOUT_SECONDS = 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +358,7 @@ async def stream_audio_chunk(
     vad_state.pending_task = asyncio.create_task(
         send_turn(pcm_bytes, orchestrate_fn=orchestrate_fn)
     )
+    vad_state.pending_task._started_at = time.monotonic()
     logger.info("VAD triggered — launched API task (%d PCM bytes)", len(pcm_bytes))
 
     yield (
@@ -422,6 +426,23 @@ async def poll_pending_result(
         )
 
     if not vad_state.pending_task.done():
+        task_age = now - getattr(vad_state.pending_task, "_started_at", now)
+        if task_age > TASK_TIMEOUT_SECONDS:
+            # API task has been running too long — cancel it and reset so the
+            # user can try again without refreshing the page.
+            logger.warning("API task timed out after %.1fs — cancelling", task_age)
+            vad_state.pending_task.cancel()
+            vad_state.pending_task = None
+            return (
+                NO_AUDIO,
+                transcript_handler.get_history(),
+                _status("Request timed out — please try again", error=True),
+                _append_trace(vad_state, {"src": "poll", "timeout": True, "task_age_s": round(task_age, 1)}),
+                transcript_handler,
+                vad_state,
+                session_state,
+                summary_store,
+            )
         return (
             NO_AUDIO,
             transcript_handler.get_history(),
@@ -548,11 +569,13 @@ def _live_trace(vad_state: VADState, extra: dict | None = None) -> dict:
         mode = "listening"
 
     stream_age = round(now - vad_state.last_stream_at, 2) if vad_state.last_stream_at > 0 else None
+    task_age = round(now - task._started_at, 1) if task is not None and hasattr(task, "_started_at") else None
     trace = {
         "mode": mode,
         "cooldown_remaining_s": remaining,
         "ignore_until_offset_s": round(vad_state.ignore_until - now, 3),
         "task_status": task_status,
+        "task_age_s": task_age,   # seconds since API task was launched; None = no task
         "is_speaking": vad_state.is_speaking,
         "speech_chunks": vad_state.speech_chunks,
         "silence_chunks": vad_state.silence_chunks,
