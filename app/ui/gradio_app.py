@@ -158,10 +158,12 @@ def _consume_finished_task(
 
     audio_output = _build_audio_output(result.audio_bytes)
 
-    # Duration-based cooldown: covers actual playback + trailing buffer
+    # Duration-based cooldown: covers actual playback + trailing buffer.
+    # Cap at 5 s so a long response never blocks the mic indefinitely.
     if result.audio_bytes:
         audio_duration_s = len(result.audio_bytes) / (DEFAULT_OUTPUT_SAMPLE_RATE * 2)
-        vad_state.ignore_until = time.monotonic() + audio_duration_s + PLAYBACK_COOLDOWN_SECONDS
+        cooldown = min(audio_duration_s, 5.0) + PLAYBACK_COOLDOWN_SECONDS
+        vad_state.ignore_until = time.monotonic() + cooldown
 
     # Build debug trace for the panel
     decision = result.orchestration_decision
@@ -302,21 +304,20 @@ async def poll_pending_result(
                 session_state,
                 summary_store,
             )
-        # Explicitly return "Listening..." when truly idle so the status never
-        # gets stuck on "Playing response..." if the browser paused the mic stream.
-        # When VAD is accumulating speech the stream handler owns the status.
-        if not vad_state.is_speaking:
-            return (
-                NO_AUDIO,
-                transcript_handler.get_history(),
-                _status("Listening..."),
-                {},
-                transcript_handler,
-                vad_state,
-                session_state,
-                summary_store,
-            )
-        return NO_AUDIO, transcript_handler.get_history(), gr.update(), gr.update(), transcript_handler, vad_state, session_state, summary_store
+        # Cooldown has expired — always return "Listening..." so the status
+        # never gets stuck.  (The is_speaking check was removed: if ambient
+        # noise set is_speaking=True during playback the poller would return
+        # gr.update() indefinitely, freezing the UI on "Playing response...".)
+        return (
+            NO_AUDIO,
+            transcript_handler.get_history(),
+            _status("Listening..."),
+            {},
+            transcript_handler,
+            vad_state,
+            session_state,
+            summary_store,
+        )
 
     if not vad_state.pending_task.done():
         return (
