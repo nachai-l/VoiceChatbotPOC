@@ -219,3 +219,38 @@ class TestVADStatePendingTask:
         state.pending_task = "some_task"
         state = reset_vad(state)
         assert state.pending_task is None
+
+
+# ---------------------------------------------------------------------------
+# VADState.ignore_until — regression: must be a proper dataclass field
+# ---------------------------------------------------------------------------
+
+class TestVADStateIgnoreUntil:
+    def test_ignore_until_is_dataclass_field(self):
+        """Regression: ignore_until was previously injected via setattr, making it
+        absent from fresh VADState instances created by reset_vad.
+        It must be a proper dataclass field so every instance has it from init."""
+        import dataclasses
+        field_names = {f.name for f in dataclasses.fields(VADState)}
+        assert "ignore_until" in field_names
+
+    def test_default_ignore_until_is_zero(self):
+        state = VADState()
+        assert state.ignore_until == 0.0
+
+    def test_reset_vad_clears_ignore_until(self):
+        """Regression: reset_vad must return a state with ignore_until == 0.0.
+        Previously, a setattr-based field was lost after reset_vad, leaving the
+        new state without the attribute entirely (relying on getattr fallback)."""
+        state = VADState()
+        state.ignore_until = 999.0
+        state = reset_vad(state)
+        assert state.ignore_until == 0.0
+
+    def test_fresh_reset_does_not_require_getattr_fallback(self):
+        """Direct attribute access (not getattr) must work after reset_vad."""
+        state = VADState()
+        state.ignore_until = 5.0
+        state = reset_vad(state)
+        # This would AttributeError if ignore_until were not a dataclass field
+        _ = state.ignore_until
