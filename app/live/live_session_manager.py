@@ -158,11 +158,18 @@ async def _send_turn_once(
 
                 async for response in session.receive():
                     msg_count += 1
+                    logger.debug(
+                        "Live response #%d: %s",
+                        msg_count,
+                        {k: v for k, v in vars(response).items() if v is not None and k != "data"}
+                        if hasattr(response, "__dict__") else str(response)[:200],
+                    )
 
                     # ---- audio data ----
                     data = getattr(response, "data", None)
                     if data:
                         audio_chunks.append(data)
+                        logger.debug("Audio chunk #%d: %d bytes", len(audio_chunks), len(data))
 
                     # ---- Phase 2: function call handling ----
                     tc = getattr(response, "tool_call", None)
@@ -215,10 +222,13 @@ async def _send_turn_once(
                             )
 
                     if getattr(sc, "turn_complete", False):
+                        total_audio = sum(len(c) for c in audio_chunks)
                         logger.info(
-                            "Turn complete after %d messages, audio=%d bytes",
-                            msg_count,
-                            sum(len(c) for c in audio_chunks),
+                            "Turn complete after %d messages: audio=%d bytes (%d chunks), "
+                            "user_tx=%r, asst_tx=%r",
+                            msg_count, total_audio, len(audio_chunks),
+                            (user_transcript[:60] + "...") if len(user_transcript) > 60 else user_transcript,
+                            (assistant_transcript[:60] + "...") if len(assistant_transcript) > 60 else assistant_transcript,
                         )
                         break
 
