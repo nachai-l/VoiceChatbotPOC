@@ -11,8 +11,11 @@ Phase 2 additions:
 """
 
 import asyncio
+import base64
+import io
 import logging
 import time
+import wave
 
 import numpy as np
 import gradio as gr
@@ -80,6 +83,48 @@ def _build_audio_output(audio_bytes: bytes):
         float(np.max(np.abs(audio_np))) if audio_np.size else 0.0,
     )
     return (int(sample_rate), audio_np)
+
+
+def _build_audio_html(audio_bytes: bytes) -> object:
+    """Encode PCM16 bytes as a WAV file and return a self-contained HTML audio element.
+
+    Returns gr.update() (no-op) when audio_bytes is empty so the player is
+    untouched between responses.  Otherwise returns an HTML <audio autoplay>
+    element with an inline base64 data URI.
+
+    Using gr.HTML instead of gr.Audio for playback decouples audio output from
+    Gradio's component update machinery.  When gr.Audio is updated with new audio
+    from the poll handler the browser resets its AudioContext, which triggers
+    echo-cancellation logic that pauses the microphone MediaStream — killing the
+    streaming input after the first turn.  A gr.HTML update is a plain DOM text
+    swap with no AudioContext involvement.
+    """
+    if not audio_bytes:
+        return gr.update()
+
+    # Apply playback gain (match _build_audio_output scaling)
+    _, audio_np = pcm16_to_numpy(audio_bytes, sample_rate=DEFAULT_OUTPUT_SAMPLE_RATE)
+    audio_np = np.asarray(audio_np, dtype=np.float32)
+    audio_np = np.clip(audio_np * PLAYBACK_GAIN, -1.0, 1.0)
+    # Convert back to PCM16 for WAV container
+    pcm16 = (audio_np * 32767).astype(np.int16)
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)       # 16-bit
+        wf.setframerate(DEFAULT_OUTPUT_SAMPLE_RATE)
+        wf.writeframes(pcm16.tobytes())
+
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    logger.info("_build_audio_html: %d samples, gain=%.1f", len(audio_np), PLAYBACK_GAIN)
+    # Each response gets a unique element id so replacing it triggers autoplay.
+    uid = int(time.monotonic() * 1000) % 1_000_000
+    return (
+        f'<audio id="r{uid}" autoplay style="width:100%">'
+        f'<source src="data:audio/wav;base64,{b64}" type="audio/wav">'
+        f"</audio>"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +241,7 @@ def _consume_finished_task(
             result.assistant_transcript or "",
         )
 
-    audio_output = _build_audio_output(result.audio_bytes)
+    audio_output = _build_audio_html(result.audio_bytes)
 
     # Duration-based cooldown — IDEMPOTENT via task._completed_at.
     #
@@ -525,7 +570,7 @@ def handle_clear(
     summary_store.clear()
     return (
         [],
-        None,
+        "",   # clear audio_player HTML
         _status("Session cleared — ready"),
         [],
         transcript_handler,
@@ -625,11 +670,12 @@ def create_app() -> gr.Blocks:
                     recording=True,
                 )
 
-                audio_output = gr.Audio(
-                    label="Assistant response",
-                    autoplay=True,
-                    type="numpy",
-                )
+                # Use gr.HTML for audio playback instead of gr.Audio.
+                # gr.Audio(autoplay=True) triggers a browser AudioContext reset
+                # when updated with new audio, which stops the mic MediaStream
+                # and kills the streaming input after every turn.
+                # gr.HTML is a plain DOM swap with no AudioContext involvement.
+                audio_player = gr.HTML(value="", label="Assistant response")
 
             with gr.Column(scale=1):
                 status_md = gr.Markdown(_status("Listening..."))
@@ -660,13 +706,13 @@ def create_app() -> gr.Blocks:
         poller.tick(
             fn=poll_pending_result,
             inputs=[transcript_state, vad_state, session_state, summary_state],
-            outputs=[audio_output, chatbot, status_md, debug_panel, transcript_state, vad_state, session_state, summary_state],
+            outputs=[audio_player, chatbot, status_md, debug_panel, transcript_state, vad_state, session_state, summary_state],
         )
 
         clear_btn.click(
             fn=handle_clear,
             inputs=[transcript_state, vad_state, session_state, summary_state],
-            outputs=[chatbot, audio_output, status_md, debug_panel, transcript_state, vad_state, session_state, summary_state],
+            outputs=[chatbot, audio_player, status_md, debug_panel, transcript_state, vad_state, session_state, summary_state],
         )
 
     return demo
