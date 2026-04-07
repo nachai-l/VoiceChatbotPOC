@@ -878,7 +878,8 @@ class TestStreamAudioChunkCooldown:
         results = await _collect(stream_audio_chunk((sr, data), handler, vad, session, summary))
         _, status, debug, _, _, _, _ = results[0]
         assert "Playing" in status
-        assert "cooldown_remaining_s" in debug[-1]
+        # stream_audio_chunk returns gr.update() for debug_panel (poll handles display)
+        assert isinstance(debug, dict) and debug.get("__type__") == "update"
 
     @pytest.mark.anyio
     async def test_resumes_listening_after_cooldown(self, handler, session, summary):
