@@ -344,17 +344,32 @@ async def stream_audio_chunk(
     where the value hasn't changed.
 
     gr.update() is still used for gr.State outputs (transcript_state,
-    vad_state, etc.) to prevent State write-back races between stream and
-    poll handlers.
+    vad_state, etc.) in the "thinking" path to prevent poll's
+    pending_task=None / ignore_until write from being overwritten.
+    In the "playing" (cooldown) path, vad_state IS returned so that
+    last_stream_at stays fresh in Gradio State and prevents the
+    _stream_dead false-positive that appears after the API latency + cooldown.
     """
     # Heartbeat: stamp last_stream_at on every call so poll can detect a dead stream.
     vad_state.last_stream_at = time.monotonic()
 
-    # Stale-copy guard: if this vad_state copy still holds a task that was
-    # already consumed by the poll handler, clear the stale reference here so
-    # stream_audio_chunk doesn't write it back to Gradio State.
+    # Stale-copy guard: this vad_state copy still holds a task that has
+    # already been consumed by poll_pending_result.  Return gr.update() for
+    # all States (same as the regular "thinking" path below) so we don't
+    # fall through to the listening/VAD paths and accidentally write back a
+    # stale vad_state with ignore_until=0, erasing poll's ignore_until=T+5.
     if vad_state.pending_task is not None and _is_task_consumed(vad_state.pending_task):
-        vad_state.pending_task = None
+        _append_trace(vad_state, {"src": "stream", "waiting": True, "stale": True})
+        yield (
+            transcript_handler.get_history(),
+            _status("Thinking..."),
+            gr.update(),           # debug_panel
+            gr.update(),           # transcript_state ← poll owns
+            gr.update(),           # vad_state ← poll owns (has ignore_until set)
+            gr.update(),           # session_state
+            gr.update(),           # summary_state
+        )
+        return
 
     if vad_state.pending_task is not None:
         # CRITICAL: return gr.update() for all gr.State outputs so that
@@ -376,14 +391,19 @@ async def stream_audio_chunk(
     now = time.monotonic()
     if now < vad_state.ignore_until:
         _append_trace(vad_state, {"src": "stream"})
-        # Return gr.update() for State outputs during playback: poll owns them.
-        # Return actual history for chatbot — gr.update() clears it in Gradio 6.
+        # During playback cooldown, poll owns transcript_state/session/summary.
+        # BUT we DO return the actual vad_state so that last_stream_at stays
+        # fresh in Gradio State.  Without this, after cooldown expires
+        # stream_age_s = API_latency + cooldown (~13s) and poll raises
+        # _stream_dead=True, showing a false "Mic stream stopped" warning.
+        # It is safe to write vad_state here because pending_task is already
+        # None (poll consumed it) so ignore_until is not at risk of being reset.
         yield (
             transcript_handler.get_history(),  # chatbot — gr.update() clears in Gradio 6
             _status("Playing response..."),
             gr.update(),           # debug_panel — poll updates it every 0.25s
             gr.update(),           # transcript_state ← poll owns this during cooldown
-            gr.update(),           # vad_state ← poll owns this during cooldown
+            vad_state,             # vad_state — write back to keep last_stream_at fresh
             gr.update(),           # session_state
             gr.update(),           # summary_state
         )

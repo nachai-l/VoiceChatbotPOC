@@ -895,9 +895,12 @@ class TestStreamAudioChunkCooldown:
     @pytest.mark.anyio
     async def test_stream_clears_stale_consumed_task(self, handler, session, summary):
         """Regression (Gradio State race): when stream_audio_chunk receives a
-        vad_state copy that still holds a _voice_consumed Task, it must clear
-        the stale reference so it doesn't write it back to Gradio State and
-        cause the poll handler to re-consume the result on the next tick."""
+        vad_state copy that still holds a _voice_consumed Task, it must NOT
+        write that stale vad_state back to Gradio State (which would erase
+        poll's ignore_until=T+5 setting and cause stuck-status bugs).
+
+        The fix returns gr.update() for vad_state in the stale-copy path,
+        which is a stronger guarantee than just clearing pending_task."""
         from app.live.live_session_manager import LiveSessionResult
 
         # Simulate a task that was already consumed by the poll handler
@@ -913,5 +916,6 @@ class TestStreamAudioChunkCooldown:
         # stream_audio_chunk yields 7 values (no audio_output)
         _, _, _, _, returned_vad, _, _ = results[0]
 
-        # The stale reference must be cleared — NOT written back
-        assert returned_vad.pending_task is None
+        # vad_state must be gr.update() (no-op) — NOT written back with stale task
+        assert isinstance(returned_vad, dict) and returned_vad.get("__type__") == "update", \
+            "stale consumed task: vad_state must be gr.update() to preserve poll's ignore_until"
